@@ -9,6 +9,6 @@ O e-SUS abre na homologação. A prévia lê as linhas visíveis do SIGSS, por i
 
 ## Transferir e auditar
 
-Na primeira configuração, habilite a API Google Sheets em um projeto Google Cloud autorizado e crie um cliente OAuth do tipo aplicativo para computador. Salve o JSON como `%USERPROFILE%\.agenda-sigss\google-client.json`. Na primeira transferência, autorize pelo navegador com uma conta que já possa editar a auditoria. O botão Abrir planilha serve para consulta.
+Clique em **Abrir planilha**, faça login com uma conta que já possa editar a auditoria e volte ao aplicativo. O Playwright escreve pela interface do Google Sheets, usando a caixa de referência das células e a área de transferência. O fluxo precisa ser validado em homologação com uma única agenda antes de uso em lote.
 
 Busque a agenda, confira a prévia e clique em **Transferir prévia**. A execução é restrita à homologação e exige uma página única e CBO confirmado. Use uma estação executora. O diário local em `%USERPROFILE%\.agenda-sigss` separa gravação no e-SUS e auditoria. Se o salvamento ficar incerto, confira o e-SUS antes de qualquer nova tentativa. Mantenha o diário e o token no computador autorizado.
