@@ -44,7 +44,7 @@ def existing_appointment(page, target, name):
     return any(cards)
 
 
-def migrate(page, day, row, target, observation):
+def migrate(page, day, row, target, observation, before_save):
     label = page.locator(".rbc-label").get_by_text(target, exact=True)
     if label.count() != 1:
         return "Inconsistência na vaga", "Horário ausente no e-SUS"
@@ -84,7 +84,10 @@ def migrate(page, day, row, target, observation):
         options.click(timeout=4000)
         if observation != "-":
             page.get_by_role("textbox", name=re.compile("Observação", re.I)).fill(observation, timeout=4000)
-        page.get_by_role("button", name="Salvar", exact=True).click(timeout=4000)
+        save = page.get_by_role("button", name="Salvar", exact=True)
+        save.wait_for(timeout=4000)
+        before_save()
+        save.click(timeout=4000)
         page.get_by_text("Agendamento de consulta cadastrado com sucesso.", exact=True).wait_for(timeout=6000)
         return "-", ""
     finally:
@@ -106,7 +109,8 @@ def connect_sheets(page, sheet_url):
     page.bring_to_front()
     page.context.grant_permissions(["clipboard-read", "clipboard-write"],
                                    origin="https://docs.google.com")
-    tab = page.get_by_role("button", name="Histórico de transferências", exact=True)
+    tab = page.get_by_role("button", name="Histórico de transferências", exact=True).or_(
+        page.get_by_role("tab", name="Histórico de transferências", exact=True))
     tab.click(timeout=6000)
     if read_range(page, "A1:J1") != [list(HEADERS)]:
         raise ValueError("Cabeçalhos da auditoria divergentes. Confira a planilha.")
@@ -114,9 +118,7 @@ def connect_sheets(page, sheet_url):
 
 
 def select_range(page, address):
-    box = page.locator("#t-name-box").locator("input")
-    if not box.count():
-        box = page.locator("input#t-name-box")
+    box = page.locator("#t-name-box input, input#t-name-box, input[aria-label=\"Caixa de nome\"], input[aria-label=\"Name box\"]")
     box.fill(address, timeout=4000)
     box.press("Enter", timeout=4000)
     return box
@@ -147,6 +149,7 @@ def set_audit_color(page, row, transferred):
 
 
 def publish(page, values, note):
+    page.bring_to_front()
     import csv
     import io
 
