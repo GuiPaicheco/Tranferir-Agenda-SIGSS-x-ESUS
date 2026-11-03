@@ -108,6 +108,7 @@ def browser_worker(commands, events):
         esus = None
         sheets = None
         batch = None
+        pending = None
         events.put(("ready", "Clique em Abrir SIGSS para entrar com sua conta."))
         while True:
             command = commands.get()
@@ -155,6 +156,13 @@ def browser_worker(commands, events):
                     events.put(("message", "Entre no e-SUS se solicitado e confira a data e o profissional."))
                 except Exception:
                     events.put(("message", "Não foi possível abrir o e-SUS. Confira o endereço e a rede."))
+                continue
+            if command[0] == "copy":
+                if pending is None:
+                    events.put(("message", "Realize a busca antes de copiar a agenda."))
+                else:
+                    batch, rows, message = pending
+                    events.put(("rows", (rows, message, False)))
                 continue
             if command[0] == "transfer":
                 position = None
@@ -219,9 +227,11 @@ def browser_worker(commands, events):
                     events.put(("message", f"Lote interrompido. {detail}"))
                 continue
             batch = None
-            first, last, professional, unit = command
+            pending = None
+            first, last, professional, unit, automatic = command
+            expected_date = first
             try:
-                previews, batches = [], []
+                previews, batches, incomplete = [], [], []
                 day = datetime.strptime(first, "%d/%m/%Y").date()
                 end_day = datetime.strptime(last, "%d/%m/%Y").date()
                 while day <= end_day:
@@ -258,13 +268,13 @@ def browser_worker(commands, events):
                     }""")
                     try:
                         sigss.get_by_role("button", name="Buscar", exact=True).click(timeout=4000)
-                        sigss.wait_for_function("""() => {
+                        sigss.wait_for_function("""settle => {
                           const changed = window.agendaWatch?.changed;
                           const grid = document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid');
                           const loading = [...(grid?.querySelectorAll('.loading, .jqgrid-overlay') || [])]
                             .some(el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
-                          return changed && !loading && performance.now() - changed >= 350;
-                        }""", timeout=20000)
+                          return changed && !loading && performance.now() - changed >= settle;
+                        }""", arg=3000 if automatic else 500, timeout=45000)
                     except Error as exc:
                         raise ValueError("O SIGSS não confirmou a atualização da grade. Tente buscar novamente.") from exc
                     finally:
@@ -311,11 +321,17 @@ def browser_worker(commands, events):
                     pages = re.search(r"de (\d+)", result.get("paging") or "")
                     cbo = (result.get("cbo") or "").split(" — ")[-1].strip()
                     if not pages or pages.group(1) != "1" or not cbo or cbo == "...":
-                        raise ValueError(f"Transferência de {expected_date} exige página única e CBO confirmado.")
+                        incomplete.append(expected_date)
                     batches.append((expected_date, full_name, result["unit"].split(" — ")[-1], cbo, rows))
                     previews.extend((expected_date, *row) for row in preview(rows))
-                batch = batches
-                events.put(("rows", (previews, "Busca do período concluída no SIGSS.")))
+                warning = ("Transferência bloqueada: paginação ou CBO não confirmado em " +
+                           ", ".join(incomplete)) if incomplete else "Agenda pronta para revisão."
+                pending = (None if incomplete else batches, previews, warning)
+                if automatic:
+                    batch = pending[0]
+                    events.put(("rows", (previews, warning, bool(batch))))
+                else:
+                    events.put(("message", "Busca confirmada. Clique em Copiar agenda."))
             except ValueError as err:
                 events.put(("message", str(err)))
             except Exception:
@@ -338,6 +354,9 @@ def main():
     def controls(enabled):
         for button in actions:
             button.configure(state="normal" if enabled else "disabled")
+        selector.configure(state="readonly" if enabled else "disabled")
+        if enabled:
+            refresh_mode()
 
     def start_browser():
         while not commands.empty():
@@ -367,6 +386,15 @@ def main():
     sigss_button.pack(side="left", padx=6)
     reconnect = ttk.Button(setup, text="Reconectar navegador", command=start_browser)
     reconnect.pack(side="left")
+    sigss_button.pack_configure(before=sheets_button)
+    esus_button.pack_configure(after=sigss_button)
+    steps = ttk.LabelFrame(root, text="Etapas da operação")
+    steps.pack(fill="x", padx=12, pady=6)
+    mode = tk.StringVar(value="Manual")
+    ttk.Label(steps, text="Modo").pack(side="left", padx=6)
+    selector = ttk.Combobox(steps, state="readonly", textvariable=mode,
+                            values=("Manual", "Automatizado"), width=14)
+    selector.pack(side="left", padx=6)
     fields = []
     for label, default in (("Data de início", datetime.now().strftime("%d/%m/%Y")),
                            ("Data de fim", datetime.now().strftime("%d/%m/%Y")),
@@ -376,7 +404,7 @@ def main():
         field.insert(0, default)
         field.pack(side="left", padx=4)
         fields.append(field)
-    def read():
+    def read(automatic=False):
         vals = [f.get().strip() for f in fields]
         try:
             if datetime.strptime(vals[0], "%d/%m/%Y") > datetime.strptime(vals[1], "%d/%m/%Y"):
@@ -386,17 +414,32 @@ def main():
         except ValueError:
             messagebox.showwarning("Filtros", "Informe início e fim válidos (dd/mm/aaaa), unidade e profissional.")
             return
+        if not automatic and vals[0] != vals[1]:
+            messagebox.showwarning("Modo manual", "Use a mesma data nos dois campos ou selecione Automatizado.")
+            return
         table.delete(*table.get_children())
-        send((vals[0], vals[1], vals[3], vals[2]), "Lendo agenda…")
-    read_button = ttk.Button(form, text="2. Buscar agendas", command=read)
-    read_button.pack(side="left", padx=8)
+        send((vals[0], vals[1], vals[3], vals[2], automatic), "Buscando no SIGSS…")
+
+    read_button = ttk.Button(steps, text="2. Realizar busca", command=read)
+    copy_button = ttk.Button(steps, text="3. Copiar agenda",
+                             command=lambda: send(("copy",), "Copiando agenda…"))
+    auto_button = ttk.Button(steps, text="Iniciar processo", command=lambda: read(True))
+    for button in (read_button, copy_button, auto_button):
+        button.pack(side="left", padx=6)
     def transfer():
         if messagebox.askyesno("Homologação", "Transferir a prévia conferida e atualizar a auditoria?"):
             send(("transfer",), "Transferindo e atualizando a auditoria…")
 
-    transfer_button = ttk.Button(form, text="3. Transferir prévia", command=transfer)
+    transfer_button = ttk.Button(steps, text="4. Transferir e auditar", command=transfer)
     transfer_button.pack(side="left", padx=6)
-    actions = (sigss_button, esus_button, sheets_button, read_button, transfer_button)
+    actions = (sigss_button, esus_button, sheets_button, read_button,
+               copy_button, auto_button, transfer_button)
+    def refresh_mode(event=None):
+        manual = mode.get() == "Manual"
+        read_button.configure(state="normal" if manual else "disabled")
+        copy_button.configure(state="normal" if manual else "disabled")
+        auto_button.configure(state="disabled" if manual else "normal")
+    selector.bind("<<ComboboxSelected>>", refresh_mode)
     frame = ttk.Frame(root)
     frame.pack(fill="both", expand=True, padx=12, pady=12)
     columns = ("Data", "SIGSS", "eSUS previsto", "Paciente", "Cod. SIGSS", "Observação prevista", "Preferências originais", "Situação")
@@ -434,10 +477,15 @@ def main():
                     continue
                 controls(True)
                 if kind == "rows":
-                    rows, message = data
+                    rows, message, automatic = data
+                    table.delete(*table.get_children())
                     for index, row in enumerate(rows):
                         table.insert("", "end", iid=str(index), values=row)
                     status.set(f"{len(rows)} registros na prévia. {message}")
+                    if automatic:
+                        root.update_idletasks()
+                        if messagebox.askyesno("Conferir agenda", "A agenda foi copiada. Você confirma a prévia?"):
+                            transfer()
                 else:
                     status.set(data)
         except Empty:
