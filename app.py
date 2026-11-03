@@ -1,4 +1,5 @@
 """Primeira versão: leitura do SIGSS e prévia para revisão."""
+import json
 import os
 import re
 import threading
@@ -8,6 +9,8 @@ from datetime import datetime
 from queue import Empty, Queue
 from tkinter import messagebox, ttk
 from urllib.parse import urlsplit
+
+from transfer import connect_sheets, journal, migrate, publish
 
 SIGSS = os.environ.get("AGENDA_SIGSS_URL", "http://sigss.betim.mg.gov.br/sigss/atendimentoConsultaAgenda2.jsp")
 ESUS = "http://kappa-hml:8080/agenda/"
@@ -104,6 +107,7 @@ def browser_worker(commands, events):
         sigss = context.new_page()
         esus = None
         sheets = None
+        batch = None
         events.put(("ready", "Clique em Abrir SIGSS para entrar com sua conta."))
         while True:
             command = commands.get()
@@ -143,6 +147,47 @@ def browser_worker(commands, events):
                 except Exception:
                     events.put(("message", "Não foi possível abrir o e-SUS. Confira o endereço e a rede."))
                 continue
+            if command[0] == "transfer":
+                try:
+                    if not batch:
+                        raise ValueError("Busque e confira as agendas antes de transferir.")
+                    day, name, unit, cbo, records, agenda_url = batch
+                    if esus.is_closed() or esus.url != agenda_url or not agenda_url.startswith(ESUS):
+                        raise ValueError("Abra a agenda correta em homologação com Buscar agendas.")
+                    api, sheet_id = connect_sheets(SHEETS)
+                    with journal() as db:
+                        for record, planned in zip(records, preview(records)):
+                            source, target, _, _, observation, _, state = planned
+                            key = json.dumps([agenda_url, day, unit, cbo, source, record["code"]])
+                            saved = db.execute("SELECT result,note FROM jobs WHERE key=?", (key,)).fetchone()
+                            if saved and saved[0] == "pendente":
+                                raise ValueError(f"Salvamento incerto às {source}. Confira a agenda antes de retomar.")
+                            if saved:
+                                reason, note = saved
+                            elif state == "Conferir no eSUS":
+                                db.execute("INSERT INTO jobs VALUES (?, ?, ?)", (key, "pendente", ""))
+                                db.commit()
+                                reason, note = migrate(esus, datetime.strptime(day, "%d/%m/%Y").date(),
+                                                       record, target, observation)
+                                db.execute("UPDATE jobs SET result=?, note=? WHERE key=?", (reason, note, key))
+                                db.commit()
+                            elif state == "Cancelado no SIGSS":
+                                reason, note = "-", state
+                            elif state == "Mais de um agendamento na mesma vaga":
+                                reason, note = state, ""
+                            else:
+                                reason, note = "Inconsistência na vaga", state
+                            success = reason == "-" and note != "Cancelado no SIGSS"
+                            publish(api, sheet_id, [day, source, target if success else "-",
+                                    "Transferido" if success else "Não transferido",
+                                    record["code"], record["name"], name, cbo, unit, reason], note)
+                    events.put(("message", "Lote concluído. Confira o histórico na planilha."))
+                except ValueError as err:
+                    events.put(("message", str(err)))
+                except Exception:
+                    events.put(("message", "Lote interrompido. Confira o e-SUS e a conexão com o Google Sheets."))
+                continue
+            batch = None
             expected_date, professional, unit = command
             try:
                 if sigss.is_closed():
@@ -194,6 +239,8 @@ def browser_worker(commands, events):
                     day: document.querySelector('input[name="agco.agcoData"]')?.value,
                     professional: selected('agco_profissionalDestino'),
                     unit: selected('agco_unidadeSaudeDestino'),
+                    paging: document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid')?.innerText.match(/Página\\s+\\d+\\s+de\\s+\\d+/i)?.[0],
+                    cbo: selected('agco_atividadeProfissionalCnes'),
                     rows: [...document.querySelectorAll('td[title*="Prontuário:"]')]
                       .filter(c => c.getBoundingClientRect().width)
                       .map(c => ({
@@ -201,6 +248,7 @@ def browser_worker(commands, events):
                         name: c.querySelector('b')?.innerText,
                         code: c.title.match(/Prontuário:\\s*([^\\n]+)/)?.[1]?.trim(),
                         status: c.closest('tr').cells[c.cellIndex+1]?.innerText.trim(),
+                        age: c.innerText.split('\\n').find(line => /\\d+ (ano|mês|dia)/.test(line)),
                         preference_titles: [...c.closest('tr').querySelectorAll(
                           'img.icon-button--transparent[title], i.icon-button--transparent[title]'
                         )].map(icon => icon.getAttribute('title'))
@@ -225,6 +273,13 @@ def browser_worker(commands, events):
                     selected = (result["professional"] or "").split(" — ")
                     full_name = selected[1] if len(selected) > 1 else professional
                     open_esus_agenda(esus, expected_date, full_name)
+                    pages = re.search(r"de (\d+)", result.get("paging") or "")
+                    cbo = (result.get("cbo") or "").split(" — ")[-1].strip()
+                    if pages and pages.group(1) == "1" and cbo and cbo != "...":
+                        batch = (expected_date, full_name, result["unit"].split(" — ")[-1],
+                                 cbo, rows, esus.url)
+                    else:
+                        message = "Prévia disponível. Transferência exige página única e CBO confirmado."
                 except (Error, ValueError):
                     esus.bring_to_front()
                     message = "Confira o login ou o acesso ao e-SUS e tente novamente."
@@ -300,7 +355,13 @@ def main():
         send(vals, "Lendo agenda…")
     read_button = ttk.Button(form, text="Buscar agendas", command=read)
     read_button.pack(side="left", padx=8)
-    actions = (sigss_button, esus_button, sheets_button, read_button)
+    def transfer():
+        if messagebox.askyesno("Homologação", "Transferir a prévia conferida e atualizar a auditoria?"):
+            send(("transfer",), "Transferindo e atualizando a auditoria…")
+
+    transfer_button = ttk.Button(form, text="Transferir prévia", command=transfer)
+    transfer_button.pack(side="left", padx=6)
+    actions = (sigss_button, esus_button, sheets_button, read_button, transfer_button)
     frame = ttk.Frame(root)
     frame.pack(fill="both", expand=True, padx=12, pady=12)
     columns = ("SIGSS", "eSUS previsto", "Paciente", "Cod. SIGSS", "Observação prevista", "Preferências originais", "Situação")
