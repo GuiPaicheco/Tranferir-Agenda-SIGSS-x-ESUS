@@ -186,12 +186,12 @@ def browser_worker(commands, events):
                         priority: (() => {
                           const headers = [...(document.querySelector('#cb_grid_busca')
                             ?.closest('tr')?.cells || [])];
-                          const index = headers.findIndex(h => /^(Risco|Prioridade)$/i.test(h.innerText.trim()));
+                          const index = headers.findIndex(h => /^(Prioridade|Prioridade preferencial|Atendimento preferencial)$/i.test(h.innerText.trim()));
                           const cell = c.closest('tr').cells[index];
                           if (!cell) return '';
                           return [cell, ...cell.querySelectorAll('[title], [aria-label], img[alt]')]
                             .flatMap(el => [el.innerText, el.title, el.getAttribute('aria-label'), el.getAttribute('alt')])
-                            .map(value => value?.trim()).find(value => value && value !== 'Risco') || '';
+                            .map(value => value?.trim()).find(value => value && !/^(Prioridade|Prioridade preferencial|Atendimento preferencial)$/i.test(value)) || '';
                         })()
                       }))
                   };
