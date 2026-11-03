@@ -74,65 +74,95 @@ def migrate(page, day, row, target, observation):
                 page.keyboard.press("Escape")
 
 
-def connect_sheets(sheet_url):
-    from google.oauth2.credentials import Credentials
-    from google.auth.transport.requests import Request
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from googleapiclient.discovery import build
-
-    STATE.mkdir(exist_ok=True)
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    client, token = STATE / "google-client.json", STATE / "google-token.json"
-    creds = Credentials.from_authorized_user_file(str(token), scopes) if token.exists() else None
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    if not creds or not creds.valid:
-        if not client.exists():
-            raise ValueError(f"Coloque o cliente OAuth de aplicativo desktop em {client}.")
-        creds = InstalledAppFlow.from_client_secrets_file(str(client), scopes).run_local_server(port=0, timeout_seconds=120)
-    token.write_text(creds.to_json(), encoding="utf-8")
-    return build("sheets", "v4", credentials=creds).spreadsheets(), urlsplit(sheet_url).path.split("/")[3]
-
-
-def publish(api, sid, values, note):
-    sheet = "'Histórico de transferências'"
-    body = api.get(spreadsheetId=sid, ranges=[sheet + "!A1:J"], includeGridData=False).execute()
-    meta = next(x["properties"] for x in body["sheets"] if x["properties"]["title"] == "Histórico de transferências")
-    table = api.values().get(spreadsheetId=sid, range=sheet + "!A1:J").execute().get("values", [])
-    if not table or tuple(table[0]) != HEADERS:
+def connect_sheets(page, sheet_url):
+    if page is None or page.is_closed():
+        raise ValueError("Clique em Abrir planilha e entre com sua conta Google.")
+    expected = urlsplit(sheet_url)
+    current = urlsplit(page.url)
+    if current.hostname != expected.hostname or current.path.split("/")[:4] != expected.path.split("/")[:4]:
+        raise ValueError("Faça login e abra a planilha de auditoria pelo aplicativo.")
+    page.bring_to_front()
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"],
+                                   origin="https://docs.google.com")
+    tab = page.get_by_role("button", name="Histórico de transferências", exact=True)
+    tab.click(timeout=6000)
+    if read_range(page, "A1:J1") != [list(HEADERS)]:
         raise ValueError("Cabeçalhos da auditoria divergentes. Confira a planilha.")
+    return page
+
+
+def select_range(page, address):
+    box = page.locator("#t-name-box").locator("input")
+    if not box.count():
+        box = page.locator("input#t-name-box")
+    box.fill(address, timeout=4000)
+    box.press("Enter", timeout=4000)
+    return box
+
+
+def read_range(page, address):
+    import csv
+    import io
+
+    select_range(page, address)
+    page.evaluate("() => navigator.clipboard.writeText('')")
+    page.keyboard.press("Control+c")
+    page.wait_for_function("async () => Boolean(await navigator.clipboard.readText())",
+                           timeout=5000)
+    raw = page.evaluate("() => navigator.clipboard.readText()")
+    return list(csv.reader(io.StringIO(raw), delimiter="\t"))
+
+
+def set_audit_color(page, row, transferred):
+    select_range(page, f"A{row}:F{row}")
+    page.get_by_role("button", name=re.compile(r"^(Cor do texto|Text color)", re.I)).click(timeout=4000)
+    color = r"^(Preto|Black)$" if transferred else r"^(Vermelho|Red)$"
+    palette = page.get_by_role("gridcell", name=re.compile(color, re.I))
+    if not palette.count():
+        palette = page.locator("[aria-label]").and_(
+            page.get_by_label(re.compile(color, re.I)))
+    palette.click(timeout=4000)
+
+
+def publish(page, values, note):
+    import csv
+    import io
+
+    box = select_range(page, "A1")
+    page.keyboard.press("Control+End")
+    last = re.fullmatch(r"[A-Z]+(\d+)", box.input_value(timeout=4000))
+    if not last:
+        raise ValueError("Não consegui confirmar a última linha da planilha.")
+    end = int(last.group(1))
+    table = read_range(page, f"A1:J{end}")
+    if not table or tuple(table[0]) != HEADERS:
+        raise ValueError("Cabeçalhos da auditoria divergentes.")
     keys = (0, 1, 4, 6, 7, 8)
-    matches = [i for i, r in enumerate(table[1:], 1) if len(r) >= 9 and all(r[k] == values[k] for k in keys)]
+    matches = [i for i, r in enumerate(table[1:], 2)
+               if len(r) >= 9 and all(r[k] == values[k] for k in keys)]
     if len(matches) > 1:
         raise ValueError("Mais de uma linha correspondente na auditoria.")
-    idx = matches[0] if matches else len(table)
-    grid = meta["sheetId"]
-    requests = []
-    if idx >= meta["gridProperties"]["rowCount"]:
-        requests.append({"appendDimension": {"sheetId": grid, "dimension": "ROWS", "length": 100}})
-    if not matches and len(table) > 1:
-        template = next((i for i, r in enumerate(table[1:], 1) if len(r) > 3 and r[3] == values[3]), 1)
-        def area(i):
-            return {"sheetId": grid, "startRowIndex": i, "endRowIndex": i+1,
-                    "startColumnIndex": 0, "endColumnIndex": 10}
-        requests.append({"copyPaste": {"source": area(template), "destination": area(idx), "pasteType": "PASTE_FORMAT"}})
-    cells = [{"userEnteredValue": {"stringValue": v}} for v in values]
-    d, m, y = map(int, values[0].split("/"))
-    cells[0]["userEnteredValue"] = {"numberValue": (date(y,m,d)-date(1899,12,30)).days}
-    for i in (1, 2):
-        if values[i] != "-":
-            h, m = map(int, values[i].split(":"))
-            cells[i]["userEnteredValue"] = {"numberValue": (h*60+m)/1440}
-    cells[9]["note"] = note
-    requests.append({"updateCells": {"start": {"sheetId": grid, "rowIndex": idx, "columnIndex": 0},
-                                     "rows": [{"values": cells}], "fields": "userEnteredValue,note"}})
-    if len(table) > 1:
-        requests.append({"repeatCell": {"range": {"sheetId": grid, "startRowIndex": idx, "endRowIndex": idx+1,
-                                                   "startColumnIndex": 0, "endColumnIndex": 6},
-            "cell": {"userEnteredFormat": {"textFormat": {"foregroundColorStyle": {
-                "rgbColor": {"red": float(values[3] == "Não transferido"), "green": 0, "blue": 0}}}}},
-            "fields": "userEnteredFormat.textFormat.foregroundColorStyle"}})
-    api.batchUpdate(spreadsheetId=sid, body={"requests": requests}).execute()
+    row = matches[0] if matches else len(table) + 1
+    if not matches:
+        row = max((i for i, cells in enumerate(table, 1) if any(cells)), default=1) + 1
+        if any(any(cells) for cells in table[row-1:]):
+            raise ValueError("Não consegui confirmar uma linha livre na auditoria.")
+    select_range(page, f"A{row}")
+    output = io.StringIO()
+    csv.writer(output, delimiter="\t", lineterminator="\r\n").writerow(values)
+    page.evaluate("text => navigator.clipboard.writeText(text)", output.getvalue())
+    page.keyboard.press("Control+v")
+    if read_range(page, f"A{row}:J{row}") != [values]:
+        raise ValueError("Não consegui confirmar os dados da auditoria após colar.")
+    set_audit_color(page, row, values[3] == "Transferido")
+    if note:
+        select_range(page, f"J{row}")
+        page.keyboard.press("Shift+F2")
+        editor = page.locator("textarea:visible")
+        if editor.count() != 1:
+            raise ValueError("Linha gravada, mas não consegui confirmar o editor da nota.")
+        editor.fill(note, timeout=4000)
+        page.keyboard.press("Tab")
 
 
 def journal():
