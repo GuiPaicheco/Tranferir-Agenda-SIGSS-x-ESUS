@@ -202,7 +202,12 @@ def search_day(sigss, expected_date, professional, unit):
     full_name = selected[1] if len(selected) > 1 else professional
     pages = re.search(r"de (\d+)", result.get("paging") or "")
     cbo = (result.get("cbo") or "").split(" — ")[-1].strip()
-    complete = bool(pages and pages.group(1) == "1" and cbo and cbo != "...")
+    problems = []
+    if not pages or pages.group(1) != "1":
+        problems.append("página única não confirmada")
+    if not cbo or cbo == "...":
+        problems.append("CBO não confirmado")
+    complete = ", ".join(problems)
     return (expected_date, full_name, result["unit"].split(" — ")[-1], cbo, rows), complete
 
 
@@ -223,7 +228,6 @@ def browser_worker(commands, events):
         esus = None
         sheets = None
         batch = None
-        pending = None
         events.put(("ready", "Clique em Abrir SIGSS para entrar com sua conta."))
         while True:
             command = commands.get()
@@ -271,13 +275,6 @@ def browser_worker(commands, events):
                     events.put(("message", "Entre no e-SUS se solicitado e confira a data e o profissional."))
                 except Exception:
                     events.put(("message", "Não foi possível abrir o e-SUS. Confira o endereço e a rede."))
-                continue
-            if command[0] == "copy":
-                if pending is None:
-                    events.put(("message", "Realize a busca antes de copiar a agenda."))
-                else:
-                    batch, rows, message = pending
-                    events.put(("rows", (rows, message, False)))
                 continue
             if command[0] == "transfer":
                 position = None
@@ -345,7 +342,6 @@ def browser_worker(commands, events):
                     events.put(("message", f"Lote interrompido. {detail}"))
                 continue
             batch = None
-            pending = None
             first, last, professional, unit, automatic = command
             expected_date = first
             try:
@@ -379,8 +375,8 @@ def browser_worker(commands, events):
                                 next(search)
                             except StopIteration as finished:
                                 item, complete = finished.value
-                            if not complete:
-                                incomplete.append(expected_date)
+                            if complete:
+                                incomplete.append(f"{expected_date}: {complete}")
                             batches.append(item)
                             previews.extend((expected_date, *row) for row in preview(item[-1]))
                     finally:
@@ -388,14 +384,10 @@ def browser_worker(commands, events):
                             search.close()
                         for page in extra:
                             page.close()
-                warning = ("Transferência bloqueada: paginação ou CBO não confirmado em " +
-                           ", ".join(incomplete)) if incomplete else "Agenda pronta para revisão."
-                pending = (None if incomplete else batches, previews, warning)
-                if automatic:
-                    batch = pending[0]
-                    events.put(("rows", (previews, warning, bool(batch))))
-                else:
-                    events.put(("message", "Busca confirmada. Clique em Copiar agenda."))
+                warning = ("Transferência bloqueada: " + "; ".join(incomplete)
+                           if incomplete else "Confira o lote e clique em Transferir e auditar.")
+                batch = None if incomplete else batches
+                events.put(("rows", (previews, warning, bool(batch))))
             except ValueError as err:
                 events.put(("message", str(err)))
             except Exception:
@@ -415,14 +407,19 @@ def main():
         finally:
             events.put(("stopped", None))
 
+    ready_to_transfer = False
+
     def controls(enabled):
         for button in actions:
             button.configure(state="normal" if enabled else "disabled")
         selector.configure(state="readonly" if enabled else "disabled")
         if enabled:
             refresh_mode()
+            transfer_button.configure(state="normal" if ready_to_transfer else "disabled")
 
     def start_browser():
+        nonlocal ready_to_transfer
+        ready_to_transfer = False
         while not commands.empty():
             commands.get_nowait()
         reconnect.configure(state="disabled")
@@ -469,6 +466,7 @@ def main():
         field.pack(side="left", padx=4)
         fields.append(field)
     def read(automatic=False):
+        nonlocal ready_to_transfer
         vals = [f.get().strip() for f in fields]
         try:
             if datetime.strptime(vals[0], "%d/%m/%Y") > datetime.strptime(vals[1], "%d/%m/%Y"):
@@ -481,27 +479,25 @@ def main():
         if not automatic and vals[0] != vals[1]:
             messagebox.showwarning("Modo manual", "Use a mesma data nos dois campos ou selecione Automatizado.")
             return
+        ready_to_transfer = False
         table.delete(*table.get_children())
         send((vals[0], vals[1], vals[3], vals[2], automatic), "Buscando no SIGSS…")
 
     read_button = ttk.Button(steps, text="2. Realizar busca", command=read)
-    copy_button = ttk.Button(steps, text="3. Copiar agenda",
-                             command=lambda: send(("copy",), "Copiando agenda…"))
-    auto_button = ttk.Button(steps, text="Iniciar processo", command=lambda: read(True))
-    for button in (read_button, copy_button, auto_button):
+    auto_button = ttk.Button(steps, text="2. Buscar período", command=lambda: read(True))
+    for button in (read_button, auto_button):
         button.pack(side="left", padx=6)
     def transfer():
         if messagebox.askyesno("Homologação", "Transferir a prévia conferida e atualizar a auditoria?"):
             send(("transfer",), "Transferindo e atualizando a auditoria…")
 
-    transfer_button = ttk.Button(steps, text="4. Transferir e auditar", command=transfer)
+    transfer_button = ttk.Button(steps, text="3. Transferir e auditar", command=transfer)
     transfer_button.pack(side="left", padx=6)
     actions = (sigss_button, esus_button, sheets_button, read_button,
-               copy_button, auto_button, transfer_button)
+               auto_button, transfer_button)
     def refresh_mode(event=None):
         manual = mode.get() == "Manual"
         read_button.configure(state="normal" if manual else "disabled")
-        copy_button.configure(state="normal" if manual else "disabled")
         auto_button.configure(state="disabled" if manual else "normal")
     selector.bind("<<ComboboxSelected>>", refresh_mode)
     frame = ttk.Frame(root)
@@ -521,6 +517,7 @@ def main():
     status = tk.StringVar(value="Abrindo navegador…")
     ttk.Label(root, textvariable=status).pack(pady=(0, 12))
     def poll():
+        nonlocal ready_to_transfer
         try:
             while True:
                 kind, data = events.get_nowait()
@@ -541,15 +538,12 @@ def main():
                     continue
                 controls(True)
                 if kind == "rows":
-                    rows, message, automatic = data
+                    rows, message, ready_to_transfer = data
+                    controls(True)
                     table.delete(*table.get_children())
                     for index, row in enumerate(rows):
                         table.insert("", "end", iid=str(index), values=row)
                     status.set(f"{len(rows)} registros na prévia. {message}")
-                    if automatic:
-                        root.update_idletasks()
-                        if messagebox.askyesno("Conferir agenda", "A agenda foi copiada. Você confirma a prévia?"):
-                            transfer()
                 else:
                     status.set(data)
         except Empty:
