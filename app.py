@@ -5,7 +5,7 @@ import re
 import threading
 import tkinter as tk
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from queue import Empty, Queue
 from tkinter import messagebox, ttk
 from urllib.parse import urlsplit
@@ -122,9 +122,18 @@ def browser_worker(commands, events):
                         sigss = context.new_page()
                     sigss.bring_to_front()
                     sigss.goto(SIGSS, wait_until="domcontentloaded", timeout=15000)
-                    events.put(("message", "Entre no SIGSS se solicitado e volte ao aplicativo."))
+                    events.put(("progress", "Aguardando login no SIGSS…"))
+                    sigss.wait_for_function("""() =>
+                      document.querySelector('input[name="agco.agcoData"]') ||
+                      [...document.querySelectorAll('a')].some(link =>
+                        link.getAttribute('href')?.includes('atendimentoConsultaAgenda2.jsp'))""",
+                      timeout=180000)
+                    if not sigss.locator('input[name="agco.agcoData"]').is_visible():
+                        sigss.goto(SIGSS, wait_until="domcontentloaded", timeout=15000)
+                    sigss.locator('input[name="agco.agcoData"]').wait_for(timeout=8000)
+                    events.put(("message", "SIGSS conectado. Informe o período, a unidade e o profissional."))
                 except Error:
-                    events.put(("message", "O SIGSS não abriu. Confira a rede da Prefeitura e tente novamente."))
+                    events.put(("message", "O SIGSS não confirmou o login e a abertura da agenda. Clique em Abrir SIGSS para tentar novamente."))
                 continue
             if command[0] == "sheets":
                 try:
@@ -151,36 +160,40 @@ def browser_worker(commands, events):
                 try:
                     if not batch:
                         raise ValueError("Busque e confira as agendas antes de transferir.")
-                    day, name, unit, cbo, records, agenda_url = batch
-                    if esus.is_closed() or esus.url != agenda_url or not agenda_url.startswith(ESUS):
-                        raise ValueError("Abra a agenda correta em homologação com Buscar agendas.")
+                    if esus is None or esus.is_closed():
+                        raise ValueError("Clique em Abrir e-SUS e faça login antes de transferir.")
                     connect_sheets(sheets, SHEETS)
                     with journal() as db:
-                        for record, planned in zip(records, preview(records)):
-                            source, target, _, _, observation, _, state = planned
-                            key = json.dumps([agenda_url, day, unit, cbo, source, record["code"]])
-                            saved = db.execute("SELECT result,note FROM jobs WHERE key=?", (key,)).fetchone()
-                            if saved and saved[0] == "pendente":
-                                raise ValueError(f"Salvamento incerto às {source}. Confira a agenda antes de retomar.")
-                            if saved:
-                                reason, note = saved
-                            elif state == "Conferir no eSUS":
-                                db.execute("INSERT INTO jobs VALUES (?, ?, ?)", (key, "pendente", ""))
-                                db.commit()
-                                reason, note = migrate(esus, datetime.strptime(day, "%d/%m/%Y").date(),
-                                                       record, target, observation)
-                                db.execute("UPDATE jobs SET result=?, note=? WHERE key=?", (reason, note, key))
-                                db.commit()
-                            elif state == "Cancelado no SIGSS":
-                                reason, note = "-", state
-                            elif state == "Mais de um agendamento na mesma vaga":
-                                reason, note = state, ""
-                            else:
-                                reason, note = "Inconsistência na vaga", state
-                            success = reason == "-" and note != "Cancelado no SIGSS"
-                            publish(sheets, [day, source, target if success else "-",
-                                    "Transferido" if success else "Não transferido",
-                                    record["code"], record["name"], name, cbo, unit, reason], note)
+                        for day, name, unit, cbo, records in batch:
+                            open_esus_agenda(esus, day, name)
+                            agenda_url = esus.url
+                            if not agenda_url.startswith(ESUS) or not agenda_url.rstrip("/").endswith(day.replace("/", "")):
+                                raise ValueError("Não foi possível confirmar a agenda de homologação.")
+                            for record, planned in zip(records, preview(records)):
+                                source, target, _, _, observation, _, state = planned
+                                key = json.dumps([agenda_url, day, unit, cbo, source, record["code"]])
+                                saved = db.execute("SELECT result,note FROM jobs WHERE key=?", (key,)).fetchone()
+                                if saved and saved[0] == "pendente":
+                                    raise ValueError(f"Salvamento incerto às {source}. Confira a agenda antes de retomar.")
+                                if saved:
+                                    reason, note = saved
+                                elif state == "Conferir no eSUS":
+                                    db.execute("INSERT INTO jobs VALUES (?, ?, ?)", (key, "pendente", ""))
+                                    db.commit()
+                                    reason, note = migrate(esus, datetime.strptime(day, "%d/%m/%Y").date(),
+                                                           record, target, observation)
+                                    db.execute("UPDATE jobs SET result=?, note=? WHERE key=?", (reason, note, key))
+                                    db.commit()
+                                elif state == "Cancelado no SIGSS":
+                                    reason, note = "-", state
+                                elif state == "Mais de um agendamento na mesma vaga":
+                                    reason, note = state, ""
+                                else:
+                                    reason, note = "Inconsistência na vaga", state
+                                success = reason == "-" and note != "Cancelado no SIGSS"
+                                publish(sheets, [day, source, target if success else "-",
+                                        "Transferido" if success else "Não transferido",
+                                        record["code"], record["name"], name, cbo, unit, reason], note)
                     events.put(("message", "Lote concluído. Confira o histórico na planilha."))
                 except ValueError as err:
                     events.put(("message", str(err)))
@@ -188,106 +201,108 @@ def browser_worker(commands, events):
                     events.put(("message", "Lote interrompido. Confira o e-SUS e a conexão com o Google Sheets."))
                 continue
             batch = None
-            expected_date, professional, unit = command
+            first, last, professional, unit = command
             try:
-                if sigss.is_closed():
-                    sigss = context.new_page()
-                date_input = sigss.locator('input[name="agco.agcoData"]')
-                if not date_input.is_visible():
-                    sigss.goto(SIGSS, wait_until="domcontentloaded", timeout=15000)
-                if not date_input.is_visible():
-                    sigss.bring_to_front()
-                    raise ValueError("Faça login no SIGSS e volte ao aplicativo.")
-                select_sigss(sigss, "agco_unidadeSaudeDestino", unit)
-                date_input.fill(expected_date, timeout=4000)
-                date_input.press("Tab")
-                select_sigss(sigss, "agco_profissionalDestino", professional)
-                sigss.evaluate("""() => {
-                  const grid = document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid');
-                  if (!grid) throw new Error('Grade da agenda não encontrada');
-                  const watch = { changed: 0 };
-                  const isRow = node => node.nodeType === 1 &&
-                    (node.matches('tr.jqgrow, td[title*="Prontuário:"]') ||
-                     node.querySelector('tr.jqgrow, td[title*="Prontuário:"]'));
-                  watch.observer = new MutationObserver(records => {
-                    if (records.some(r => [...r.addedNodes, ...r.removedNodes].some(isRow)
-                        || r.target.parentElement?.closest('.ui-paging-info'))) {
-                      watch.changed = performance.now();
-                    }
-                  });
-                  watch.observer.observe(grid, {subtree: true, childList: true, characterData: true});
-                  window.agendaWatch = watch;
-                }""")
-                try:
-                    sigss.get_by_role("button", name="Buscar", exact=True).click(timeout=4000)
-                    sigss.wait_for_function("""() => {
-                      const changed = window.agendaWatch?.changed;
+                previews, batches = [], []
+                day = datetime.strptime(first, "%d/%m/%Y").date()
+                end_day = datetime.strptime(last, "%d/%m/%Y").date()
+                while day <= end_day:
+                    expected_date = day.strftime("%d/%m/%Y")
+                    day += timedelta(days=1)
+                    events.put(("progress", f"Buscando {expected_date} no SIGSS…"))
+                    if sigss.is_closed():
+                        sigss = context.new_page()
+                    date_input = sigss.locator('input[name="agco.agcoData"]')
+                    if not date_input.is_visible():
+                        sigss.goto(SIGSS, wait_until="domcontentloaded", timeout=15000)
+                    if not date_input.is_visible():
+                        sigss.bring_to_front()
+                        raise ValueError("Faça login no SIGSS e volte ao aplicativo.")
+                    date_input.fill(expected_date, timeout=4000)
+                    date_input.press("Tab")
+                    select_sigss(sigss, "agco_unidadeSaudeDestino", unit)
+                    select_sigss(sigss, "agco_profissionalDestino", professional)
+                    sigss.evaluate("""() => {
                       const grid = document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid');
-                      const loading = [...(grid?.querySelectorAll('.loading, .jqgrid-overlay') || [])]
-                        .some(el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
-                      return changed && !loading && performance.now() - changed >= 350;
-                    }""", timeout=20000)
-                except Error as exc:
-                    raise ValueError("O SIGSS não confirmou a atualização da grade. Tente buscar novamente.") from exc
-                finally:
-                    if not sigss.is_closed():
-                        sigss.evaluate("() => window.agendaWatch?.observer.disconnect()")
-                result = sigss.evaluate("""() => {
-                  const selected = stem => document.querySelector(
-                    '[id^="' + stem + '"][id$="_chzn"] .chzn-single')?.innerText;
-                  return {
-                    day: document.querySelector('input[name="agco.agcoData"]')?.value,
-                    professional: selected('agco_profissionalDestino'),
-                    unit: selected('agco_unidadeSaudeDestino'),
-                    paging: document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid')?.innerText.match(/Página\\s+\\d+\\s+de\\s+\\d+/i)?.[0],
-                    cbo: selected('agco_atividadeProfissionalCnes'),
-                    rows: [...document.querySelectorAll('td[title*="Prontuário:"]')]
-                      .filter(c => c.getBoundingClientRect().width)
-                      .map(c => ({
-                        hour: c.closest('tr').innerText.match(/\\b\\d\\d:\\d\\d\\b/)?.[0],
-                        name: c.querySelector('b')?.innerText,
-                        code: c.title.match(/Prontuário:\\s*([^\\n]+)/)?.[1]?.trim(),
-                        status: c.closest('tr').cells[c.cellIndex+1]?.innerText.trim(),
-                        age: c.innerText.split('\\n').find(line => /\\d+ (ano|mês|dia)/.test(line)),
-                        preference_titles: [...c.closest('tr').querySelectorAll(
-                          'img.icon-button--transparent[title], i.icon-button--transparent[title]'
-                        )].map(icon => icon.getAttribute('title'))
-                      }))
-                  };
-                }""")
-                if (result["day"] != expected_date
-                    or professional.casefold() not in (result["professional"] or "").casefold()
-                    or unit.casefold() not in (result["unit"] or "").casefold()):
-                    raise ValueError("Os filtros do SIGSS não correspondem à data, unidade e profissional informados.")
-                rows = result["rows"]
-                if not rows:
-                    raise ValueError("Nenhum registro visível. Confira os filtros e clique em Buscar no SIGSS.")
-                if any(not r.get("name") or not r.get("code") or
-                       not re.fullmatch(r"\d{2}:\d{2}", r.get("hour") or "") for r in rows):
-                    raise ValueError("A lista contém registros incompletos. Confira a tela do SIGSS.")
-                message = "Agenda aberta no e-SUS."
-                try:
-                    if esus is None or esus.is_closed():
-                        esus = context.new_page()
-                        esus.goto(ESUS, wait_until="domcontentloaded", timeout=12000)
+                      if (!grid) throw new Error('Grade da agenda não encontrada');
+                      const watch = { changed: 0 };
+                      const isRow = node => node.nodeType === 1 &&
+                        (node.matches('tr.jqgrow, td[title*="Prontuário:"]') ||
+                         node.querySelector('tr.jqgrow, td[title*="Prontuário:"]'));
+                      watch.observer = new MutationObserver(records => {
+                        if (records.some(r => [...r.addedNodes, ...r.removedNodes].some(isRow)
+                            || r.target.parentElement?.closest('.ui-paging-info'))) {
+                          watch.changed = performance.now();
+                        }
+                      });
+                      watch.observer.observe(grid, {subtree: true, childList: true, characterData: true});
+                      window.agendaWatch = watch;
+                    }""")
+                    try:
+                        sigss.get_by_role("button", name="Buscar", exact=True).click(timeout=4000)
+                        sigss.wait_for_function("""() => {
+                          const changed = window.agendaWatch?.changed;
+                          const grid = document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid');
+                          const loading = [...(grid?.querySelectorAll('.loading, .jqgrid-overlay') || [])]
+                            .some(el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+                          return changed && !loading && performance.now() - changed >= 350;
+                        }""", timeout=20000)
+                    except Error as exc:
+                        raise ValueError("O SIGSS não confirmou a atualização da grade. Tente buscar novamente.") from exc
+                    finally:
+                        if not sigss.is_closed():
+                            sigss.evaluate("() => window.agendaWatch?.observer.disconnect()")
+                    result = sigss.evaluate("""() => {
+                      const selected = stem => document.querySelector(
+                        '[id^="' + stem + '"][id$="_chzn"] .chzn-single')?.innerText;
+                      return {
+                        day: document.querySelector('input[name="agco.agcoData"]')?.value,
+                        professional: selected('agco_profissionalDestino'),
+                        unit: selected('agco_unidadeSaudeDestino'),
+                        empty: /Nenhum registro/i.test(document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid')?.innerText || ''),
+                        paging: document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid')?.innerText.match(/Página\\s+\\d+\\s+de\\s+\\d+/i)?.[0],
+                        cbo: selected('agco_atividadeProfissionalCnes'),
+                        rows: [...document.querySelectorAll('td[title*="Prontuário:"]')]
+                          .filter(c => c.getBoundingClientRect().width)
+                          .map(c => ({
+                            hour: c.closest('tr').innerText.match(/\\b\\d\\d:\\d\\d\\b/)?.[0],
+                            name: c.querySelector('b')?.innerText,
+                            code: c.title.match(/Prontuário:\\s*([^\\n]+)/)?.[1]?.trim(),
+                            status: c.closest('tr').cells[c.cellIndex+1]?.innerText.trim(),
+                            age: c.innerText.split('\\n').find(line => /\\d+ (ano|mês|dia)/.test(line)),
+                            preference_titles: [...c.closest('tr').querySelectorAll(
+                              'img.icon-button--transparent[title], i.icon-button--transparent[title]'
+                            )].map(icon => icon.getAttribute('title'))
+                          }))
+                      };
+                    }""")
+                    if (result["day"] != expected_date
+                        or professional.casefold() not in (result["professional"] or "").casefold()
+                        or unit.casefold() not in (result["unit"] or "").casefold()):
+                        raise ValueError("Os filtros do SIGSS não correspondem à data, unidade e profissional informados.")
+                    rows = result["rows"]
+                    if not rows:
+                        if not result.get("empty"):
+                            raise ValueError(f"O SIGSS não confirmou o resultado de {expected_date}.")
+                        continue
+                    if any(not r.get("name") or not r.get("code") or
+                           not re.fullmatch(r"\d{2}:\d{2}", r.get("hour") or "") for r in rows):
+                        raise ValueError("A lista contém registros incompletos. Confira a tela do SIGSS.")
                     selected = (result["professional"] or "").split(" — ")
                     full_name = selected[1] if len(selected) > 1 else professional
-                    open_esus_agenda(esus, expected_date, full_name)
                     pages = re.search(r"de (\d+)", result.get("paging") or "")
                     cbo = (result.get("cbo") or "").split(" — ")[-1].strip()
-                    if pages and pages.group(1) == "1" and cbo and cbo != "...":
-                        batch = (expected_date, full_name, result["unit"].split(" — ")[-1],
-                                 cbo, rows, esus.url)
-                    else:
-                        message = "Prévia disponível. Transferência exige página única e CBO confirmado."
-                except (Error, ValueError):
-                    esus.bring_to_front()
-                    message = "Confira o login ou o acesso ao e-SUS e tente novamente."
-                events.put(("rows", (list(preview(rows)), message)))
+                    if not pages or pages.group(1) != "1" or not cbo or cbo == "...":
+                        raise ValueError(f"Transferência de {expected_date} exige página única e CBO confirmado.")
+                    batches.append((expected_date, full_name, result["unit"].split(" — ")[-1], cbo, rows))
+                    previews.extend((expected_date, *row) for row in preview(rows))
+                batch = batches
+                events.put(("rows", (previews, "Busca do período concluída no SIGSS.")))
             except ValueError as err:
                 events.put(("message", str(err)))
             except Exception:
-                events.put(("message", "Falha ao ler o SIGSS. Confira se a guia está aberta e tente novamente."))
+                events.put(("message", f"Falha na busca de {expected_date}. Confira o login e tente novamente."))
+
 
 def main():
     root = tk.Tk()
@@ -329,31 +344,33 @@ def main():
     esus_button = ttk.Button(setup, text="Abrir e-SUS",
                              command=lambda: send(("esus",), "Abrindo e-SUS…"))
     esus_button.pack(side="left")
-    sigss_button = ttk.Button(setup, text="Abrir SIGSS",
+    sigss_button = ttk.Button(setup, text="1. Abrir SIGSS",
                              command=lambda: send(("sigss",), "Abrindo SIGSS…"))
     sigss_button.pack(side="left", padx=6)
     reconnect = ttk.Button(setup, text="Reconectar navegador", command=start_browser)
     reconnect.pack(side="left")
     fields = []
-    for label, default in (("Data", datetime.now().strftime("%d/%m/%Y")),
-                           ("Profissional", ""), ("Unidade", "UBS CIDADE VERDE")):
+    for label, default in (("Data de início", datetime.now().strftime("%d/%m/%Y")),
+                           ("Data de fim", datetime.now().strftime("%d/%m/%Y")),
+                           ("Unidade", "UBS CIDADE VERDE"), ("Profissional", "")):
         ttk.Label(form, text=label).pack(side="left", padx=4)
-        field = ttk.Entry(form, width=26)
+        field = ttk.Entry(form, width=19)
         field.insert(0, default)
         field.pack(side="left", padx=4)
         fields.append(field)
     def read():
         vals = [f.get().strip() for f in fields]
         try:
-            datetime.strptime(vals[0], "%d/%m/%Y")
+            if datetime.strptime(vals[0], "%d/%m/%Y") > datetime.strptime(vals[1], "%d/%m/%Y"):
+                raise ValueError
             if not all(vals):
                 raise ValueError
         except ValueError:
-            messagebox.showwarning("Filtros", "Informe data (dd/mm/aaaa), profissional e unidade.")
+            messagebox.showwarning("Filtros", "Informe início e fim válidos (dd/mm/aaaa), unidade e profissional.")
             return
         table.delete(*table.get_children())
-        send(vals, "Lendo agenda…")
-    read_button = ttk.Button(form, text="Buscar agendas", command=read)
+        send((vals[0], vals[1], vals[3], vals[2]), "Lendo agenda…")
+    read_button = ttk.Button(form, text="2. Buscar agendas", command=read)
     read_button.pack(side="left", padx=8)
     def transfer():
         if messagebox.askyesno("Homologação", "Transferir a prévia conferida e atualizar a auditoria?"):
@@ -364,9 +381,9 @@ def main():
     actions = (sigss_button, esus_button, sheets_button, read_button, transfer_button)
     frame = ttk.Frame(root)
     frame.pack(fill="both", expand=True, padx=12, pady=12)
-    columns = ("SIGSS", "eSUS previsto", "Paciente", "Cod. SIGSS", "Observação prevista", "Preferências originais", "Situação")
+    columns = ("Data", "SIGSS", "eSUS previsto", "Paciente", "Cod. SIGSS", "Observação prevista", "Preferências originais", "Situação")
     table = ttk.Treeview(frame, columns=columns, show="headings")
-    for col, width in zip(columns, (70, 85, 200, 85, 200, 200, 220)):
+    for col, width in zip(columns, (100, 70, 85, 200, 85, 200, 200, 220)):
         table.heading(col, text=col)
         table.column(col, width=width)
     scroll = ttk.Scrollbar(frame, command=table.yview)
@@ -382,6 +399,9 @@ def main():
                 if kind == "stopped":
                     controls(False)
                     reconnect.configure(state="normal")
+                    continue
+                if kind == "progress":
+                    status.set(data)
                     continue
                 controls(True)
                 if kind == "rows":
