@@ -250,33 +250,60 @@ def browser_worker(commands, events):
                     date_input.press("Tab")
                     select_sigss(sigss, "agco_unidadeSaudeDestino", unit)
                     select_sigss(sigss, "agco_profissionalDestino", professional)
+                    filters = {"day": expected_date, "unit": unit, "professional": professional}
+                    if not sigss.evaluate("""filters => {
+                      const selected = stem => document.querySelector(
+                        '[id^="' + stem + '"][id$="_chzn"] .chzn-single'
+                      )?.innerText.toLowerCase() || '';
+                      return document.querySelector('input[name="agco.agcoData"]')?.value === filters.day
+                        && selected('agco_unidadeSaudeDestino').includes(filters.unit.toLowerCase())
+                        && selected('agco_profissionalDestino').includes(filters.professional.toLowerCase());
+                    }""", filters):
+                        raise ValueError(f"Data pendente: {expected_date}. Os filtros mudaram antes da busca.")
                     sigss.evaluate("""() => {
+                      const indicator = document.querySelector('#load_grid_busca');
                       const grid = document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid');
-                      if (!grid) throw new Error('Grade da agenda não encontrada');
-                      const watch = { changed: 0 };
+                      const visible = el => el.getClientRects().length > 0
+                        && getComputedStyle(el).visibility === 'visible';
+                      if (!grid || !indicator || visible(indicator)) {
+                        throw new Error('Indicador indisponível ou consulta anterior em andamento');
+                      }
+                      const watch = { started: false, finished: 0, changed: 0, invalid: false };
                       const isRow = node => node.nodeType === 1 &&
                         (node.matches('tr.jqgrow, td[title*="Prontuário:"]') ||
                          node.querySelector('tr.jqgrow, td[title*="Prontuário:"]'));
                       watch.observer = new MutationObserver(records => {
-                        if (records.some(r => [...r.addedNodes, ...r.removedNodes].some(isRow)
-                            || r.target.parentElement?.closest('.ui-paging-info'))) {
+                        if (!indicator.isConnected || !grid.isConnected) {
+                          watch.invalid = true;
+                          return;
+                        }
+                        if (visible(indicator)) {
+                          watch.started = true;
+                          watch.finished = 0;
+                        } else if (watch.started && !watch.finished) {
+                          watch.finished = performance.now();
+                        }
+                        if (watch.started && records.some(record =>
+                          [...record.addedNodes, ...record.removedNodes].some(isRow) ||
+                          (record.target.nodeType === 1 ? record.target :
+                            record.target.parentElement)?.closest('.ui-paging-info'))) {
                           watch.changed = performance.now();
                         }
                       });
                       watch.observer.observe(grid, {subtree: true, childList: true, characterData: true});
+                      watch.observer.observe(indicator, {attributes: true,
+                        attributeFilter: ['style', 'class', 'hidden']});
                       window.agendaWatch = watch;
                     }""")
                     try:
                         sigss.get_by_role("button", name="Buscar", exact=True).click(timeout=4000)
                         sigss.wait_for_function("""settle => {
-                          const changed = window.agendaWatch?.changed;
-                          const grid = document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid');
-                          const loading = [...(grid?.querySelectorAll('.loading, .jqgrid-overlay') || [])]
-                            .some(el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
-                          return changed && !loading && performance.now() - changed >= settle;
+                          const w = window.agendaWatch;
+                          return w && !w.invalid && w.finished && w.changed
+                            && performance.now() - Math.max(w.finished, w.changed) >= settle;
                         }""", arg=3000 if automatic else 500, timeout=45000)
                     except Error as exc:
-                        raise ValueError("O SIGSS não confirmou a atualização da grade. Tente buscar novamente.") from exc
+                        raise ValueError(f"Data pendente: {expected_date}. O SIGSS não confirmou o ciclo de carregamento e a atualização da grade.") from exc
                     finally:
                         if not sigss.is_closed():
                             sigss.evaluate("() => window.agendaWatch?.observer.disconnect()")
@@ -312,7 +339,7 @@ def browser_worker(commands, events):
                     if not rows:
                         if not result.get("empty"):
                             raise ValueError(f"O SIGSS não confirmou o resultado de {expected_date}.")
-                        continue
+                        raise ValueError(f"Data pendente: {expected_date}. A grade vazia ainda precisa ser validada no SIGSS.")
                     if any(not r.get("name") or not r.get("code") or
                            not re.fullmatch(r"\d{2}:\d{2}", r.get("hour") or "") for r in rows):
                         raise ValueError("A lista contém registros incompletos. Confira a tela do SIGSS.")
