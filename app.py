@@ -10,7 +10,7 @@ from queue import Empty, Queue
 from tkinter import messagebox, ttk
 from urllib.parse import urlsplit
 
-from transfer import connect_sheets, journal, migrate, publish
+from transfer import connect_sheets, existing_appointment, journal, migrate, publish
 
 SIGSS = os.environ.get("AGENDA_SIGSS_URL", "http://sigss.betim.mg.gov.br/sigss/atendimentoConsultaAgenda2.jsp")
 ESUS = "http://kappa-hml:8080/agenda/"
@@ -181,16 +181,17 @@ def browser_worker(commands, events):
                                     f"{completed + 1}/{total} · {day} · {source}")))
                                 key = json.dumps([agenda_url, day, unit, cbo, source, record["code"]])
                                 saved = db.execute("SELECT result,note FROM jobs WHERE key=?", (key,)).fetchone()
-                                if saved and saved[0] == "pendente":
-                                    raise ValueError(f"Salvamento incerto às {source}. Confira a agenda antes de retomar.")
-                                if saved:
-                                    reason, note = saved
-                                elif state == "Conferir no eSUS":
-                                    db.execute("INSERT INTO jobs VALUES (?, ?, ?)", (key, "pendente", ""))
-                                    db.commit()
-                                    reason, note = migrate(esus, datetime.strptime(day, "%d/%m/%Y").date(),
-                                                           record, target, observation)
-                                    db.execute("UPDATE jobs SET result=?, note=? WHERE key=?", (reason, note, key))
+                                if state == "Conferir no eSUS":
+                                    if existing_appointment(esus, target, record["name"]):
+                                        reason, note = "-", ""
+                                    elif saved and saved[0] in ("pendente", "-"):
+                                        raise ValueError(f"Não consegui confirmar o agendamento anterior às {source}. Confira o e-SUS antes de retomar.")
+                                    else:
+                                        db.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?)", (key, "pendente", ""))
+                                        db.commit()
+                                        reason, note = migrate(esus, datetime.strptime(day, "%d/%m/%Y").date(),
+                                                               record, target, observation)
+                                    db.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?)", (key, reason, note))
                                     db.commit()
                                 elif state == "Cancelado no SIGSS":
                                     reason, note = "-", state
