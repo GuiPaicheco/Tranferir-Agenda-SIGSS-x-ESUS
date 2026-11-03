@@ -8,7 +8,7 @@ from datetime import datetime
 from queue import Empty, Queue
 from tkinter import messagebox, ttk
 
-SIGSS = os.environ.get("AGENDA_SIGSS_URL", "")
+SIGSS = os.environ.get("AGENDA_SIGSS_URL", "http://sigss.betim.mg.gov.br/sigss/atendimentoConsultaAgenda2.jsp")
 ESUS = os.environ.get("AGENDA_ESUS_HML_URL", "")
 
 def convert(hour):
@@ -88,9 +88,9 @@ def browser_worker(commands, events):
 
 def main():
     root = tk.Tk()
-    if not SIGSS or not ESUS:
+    if not ESUS:
         root.withdraw()
-        messagebox.showerror("Configuração", "Defina AGENDA_SIGSS_URL e AGENDA_ESUS_HML_URL antes de iniciar.")
+        messagebox.showerror("Configuração", "Defina AGENDA_ESUS_HML_URL antes de iniciar.")
         root.destroy()
         return
     root.title("Transferência de Agenda | Homologação | Prévia")
