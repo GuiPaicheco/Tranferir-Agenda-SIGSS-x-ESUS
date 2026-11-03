@@ -22,6 +22,28 @@ def compatible(age, birth, day):
     return date(y, m, min(birth.day, monthrange(y, m)[1])) + timedelta(days=days) == day
 
 
+def existing_appointment(page, target, name):
+    label = page.locator(".rbc-label").get_by_text(target, exact=True)
+    if label.count() != 1:
+        return False
+    cards = label.evaluate("""(label, name) => {
+      const norm = s => s.normalize('NFC').trim().replace(/\\s+/g, ' ').toLowerCase();
+      const y = label.getBoundingClientRect().top;
+      const slot = [...document.querySelectorAll('.rbc-day-slot .rbc-time-slot')]
+        .find(el => Math.abs(el.getBoundingClientRect().top-y)<15);
+      if (!slot) return null;
+      const r = slot.getBoundingClientRect();
+      return [...document.querySelectorAll('.rbc-day-slot .rbc-event')]
+        .filter(card => {
+          const top = card.getBoundingClientRect().top;
+          return top >= r.top-2 && top < r.bottom-2;
+        }).map(card => card.innerText.split('\\n').some(line => norm(line) === norm(name)));
+    }""", name)
+    if cards is None or (any(cards) and len(cards) != 1):
+        raise ValueError("Não consegui confirmar um único agendamento na vaga.")
+    return any(cards)
+
+
 def migrate(page, day, row, target, observation):
     label = page.locator(".rbc-label").get_by_text(target, exact=True)
     if label.count() != 1:
