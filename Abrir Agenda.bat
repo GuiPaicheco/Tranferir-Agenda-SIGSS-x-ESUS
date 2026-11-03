@@ -1,10 +1,13 @@
 @echo off
 cd /d "%~dp0"
 if exist ".venv\agenda-pronta" goto open
+if exist ".venv\Scripts\python.exe" goto dependencies
 where py >nul 2>&1 || goto missing
 py -m venv .venv || goto failed
+:dependencies
+".venv\Scripts\python.exe" -c "import playwright.sync_api" >nul 2>&1 && goto ready
 ".venv\Scripts\python.exe" -m pip install playwright || goto failed
-".venv\Scripts\python.exe" -m playwright install chromium || goto failed
+:ready
 type nul > ".venv\agenda-pronta"
 goto open
 :missing
