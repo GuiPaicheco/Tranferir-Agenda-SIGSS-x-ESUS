@@ -35,12 +35,24 @@ def preview(records):
                r["name"], r["code"], state)
 
 def browser_worker(commands, events):
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import Error, sync_playwright
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=False)
+        for channel in ("chrome", "msedge"):
+            try:
+                browser = pw.chromium.launch(channel=channel, headless=False)
+                break
+            except Error:
+                continue
+        else:
+            events.put(("message", "Não foi possível iniciar o Chrome ou o Edge instalado."))
+            return
         context = browser.new_context()
         sigss = context.new_page()
-        sigss.goto(SIGSS, wait_until="domcontentloaded")
+        try:
+            sigss.goto(SIGSS, wait_until="domcontentloaded", timeout=15000)
+        except Error:
+            events.put(("message", "O SIGSS não abriu. Confira a conexão com a rede da Prefeitura."))
+            return
         esus = context.new_page()
         events.put(("message", "Entre no SIGSS e selecione a agenda."))
         while True:
