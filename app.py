@@ -10,12 +10,13 @@ from tkinter import messagebox, ttk
 from urllib.parse import urlsplit
 
 SIGSS = os.environ.get("AGENDA_SIGSS_URL", "http://sigss.betim.mg.gov.br/sigss/atendimentoConsultaAgenda2.jsp")
-ESUS = os.environ.get("AGENDA_ESUS_HML_URL", "")
+ESUS = "http://kappa-hml:8080/agenda/"
+SHEETS = "https://docs.google.com/spreadsheets/d/1IC0yg-J58_wYIdYwIy19BJPnCyoiw-wzPWC-NH2v2II/edit?usp=sharing"
 
 def convert(hour):
     h, m = map(int, hour.split(":"))
-    m = {1: 0, 21: 20, 31: 40, 41: 40, 30: 40}.get(m, m)
-    return f"{h:02d}:{m:02d}"
+    rounded = 20 * ((h * 60 + m + 10) // 20)
+    return "-" if rounded >= 1440 else f"{rounded // 60:02d}:{rounded % 60:02d}"
 
 def preview(records):
     active = Counter(convert(r["hour"]) for r in records if r["status"] != "Cancelado")
@@ -34,6 +35,40 @@ def preview(records):
         yield (r["hour"], "-" if state != "Conferir no eSUS" else hour,
                r["name"], r["code"], state)
 
+def select_sigss(page, stem, query):
+    field = page.locator(f'[id^="{stem}"][id$="_chzn"]')
+    selected = field.locator(".chzn-single")
+    if query.casefold() in selected.inner_text(timeout=4000).casefold():
+        return
+    selected.click(timeout=4000)
+    search = field.locator(".chzn-input-search")
+    search.fill("")
+    search.press_sequentially(query)
+    search.press("Enter")
+    matches = field.locator(".chzn-results tbody tr:visible").filter(
+        has_text=re.compile(re.escape(query), re.I))
+    matches.first.wait_for(timeout=6000)
+    if matches.count() != 1:
+        search.press("Escape")
+        raise ValueError("Busca ambígua no SIGSS. Informe o nome completo.")
+    matches.click(timeout=4000)
+
+
+def open_esus_agenda(page, day, professional):
+    field = page.get_by_role("textbox", name=re.compile("Busque um profissional"))
+    field.fill(professional, timeout=5000)
+    matches = page.get_by_role("option", name=re.compile(re.escape(professional), re.I))
+    matches.first.wait_for(timeout=6000)
+    if matches.count() != 1:
+        raise ValueError("Busca ambígua no e-SUS. Informe o nome completo.")
+    matches.click(timeout=4000)
+    page.wait_for_url(re.compile(r"/agenda/\d+(?:/.*)?$"), timeout=6000)
+    professional_id = urlsplit(page.url).path.strip("/").split("/")[1]
+    page.goto(f"{ESUS}{professional_id}/{day.replace('/', '')}",
+              wait_until="domcontentloaded", timeout=12000)
+    field.wait_for(timeout=6000)
+
+
 def browser_worker(commands, events):
     from playwright.sync_api import Error, sync_playwright
     with sync_playwright() as pw:
@@ -49,6 +84,7 @@ def browser_worker(commands, events):
         context = browser.new_context()
         sigss = context.new_page()
         esus = None
+        sheets = None
         events.put(("ready", "Clique em Abrir SIGSS para entrar com sua conta."))
         while True:
             command = commands.get()
@@ -63,16 +99,26 @@ def browser_worker(commands, events):
                         sigss = context.new_page()
                     sigss.bring_to_front()
                     sigss.goto(SIGSS, wait_until="domcontentloaded", timeout=15000)
-                    events.put(("message", "Entre no SIGSS se solicitado. Abra Atendimento Consulta e clique em Buscar após selecionar os filtros."))
+                    events.put(("message", "Entre no SIGSS se solicitado e volte ao aplicativo."))
                 except Error:
                     events.put(("message", "O SIGSS não abriu. Confira a rede da Prefeitura e tente novamente."))
+                continue
+            if command[0] == "sheets":
+                try:
+                    if sheets is None or sheets.is_closed():
+                        sheets = context.new_page()
+                    sheets.bring_to_front()
+                    sheets.goto(SHEETS, wait_until="domcontentloaded", timeout=15000)
+                    events.put(("message", "Entre no Google com uma conta autorizada, se solicitado."))
+                except Error:
+                    events.put(("message", "Não foi possível abrir a planilha. Confira a conexão."))
                 continue
             if command[0] == "esus":
                 try:
                     if esus is None or esus.is_closed():
                         esus = context.new_page()
                     esus.bring_to_front()
-                    esus.goto(command[1], wait_until="domcontentloaded", timeout=12000)
+                    esus.goto(ESUS, wait_until="domcontentloaded", timeout=12000)
                     esus.bring_to_front()
                     events.put(("message", "Entre no e-SUS se solicitado e confira a data e o profissional."))
                 except Exception:
@@ -80,8 +126,28 @@ def browser_worker(commands, events):
                 continue
             expected_date, professional, unit = command
             try:
-                if sigss.is_closed() or sigss.url.split("?")[0] != SIGSS:
-                    raise ValueError("Clique em Abrir SIGSS, faça login se solicitado e abra Atendimento Consulta.")
+                if sigss.is_closed():
+                    sigss = context.new_page()
+                date_input = sigss.locator('input[name="agco.agcoData"]')
+                if not date_input.is_visible():
+                    sigss.goto(SIGSS, wait_until="domcontentloaded", timeout=15000)
+                if not date_input.is_visible():
+                    sigss.bring_to_front()
+                    raise ValueError("Faça login no SIGSS e volte ao aplicativo.")
+                select_sigss(sigss, "agco_unidadeSaudeDestino", unit)
+                date_input.fill(expected_date, timeout=4000)
+                date_input.press("Tab")
+                select_sigss(sigss, "agco_profissionalDestino", professional)
+                with sigss.expect_response(
+                    lambda response: response.request.resource_type in ("xhr", "fetch")
+                    and urlsplit(response.url).netloc == urlsplit(SIGSS).netloc,
+                    timeout=10000,
+                ) as request:
+                    sigss.get_by_role("button", name="Buscar", exact=True).click(timeout=4000)
+                response = request.value
+                response.finished()
+                if not response.ok:
+                    raise ValueError("A consulta da agenda falhou no SIGSS.")
                 result = sigss.evaluate("""() => {
                   const selected = stem => document.querySelector(
                     '[id^="' + stem + '"][id$="_chzn"] .chzn-single')?.innerText;
@@ -109,7 +175,18 @@ def browser_worker(commands, events):
                 if any(not r.get("name") or not r.get("code") or
                        not re.fullmatch(r"\d{2}:\d{2}", r.get("hour") or "") for r in rows):
                     raise ValueError("A lista contém registros incompletos. Confira a tela do SIGSS.")
-                events.put(("rows", list(preview(rows))))
+                message = "Agenda aberta no e-SUS."
+                try:
+                    if esus is None or esus.is_closed():
+                        esus = context.new_page()
+                        esus.goto(ESUS, wait_until="domcontentloaded", timeout=12000)
+                    selected = (result["professional"] or "").split(" — ")
+                    full_name = selected[1] if len(selected) > 1 else professional
+                    open_esus_agenda(esus, expected_date, full_name)
+                except (Error, ValueError):
+                    esus.bring_to_front()
+                    message = "Confira o login ou o acesso ao e-SUS e tente novamente."
+                events.put(("rows", (list(preview(rows)), message)))
             except ValueError as err:
                 events.put(("message", str(err)))
             except Exception:
@@ -144,30 +221,16 @@ def main():
         controls(False)
         status.set(message)
         commands.put(command)
-    ttk.Label(root, text="Homologação • confira os filtros e clique em Buscar no SIGSS antes de ler a agenda.").pack(pady=12)
+    ttk.Label(root, text="Homologação • faça login nos sistemas e selecione a agenda aqui.").pack(pady=12)
     form = ttk.Frame(root)
     form.pack(fill="x", padx=12)
     setup = ttk.Frame(root)
     setup.pack(fill="x", padx=12, pady=(0, 8))
-    ttk.Label(setup, text="Link do e-SUS de homologação").pack(side="left")
-    esus_url = ttk.Entry(setup)
-    esus_url.insert(0, ESUS)
-    esus_url.pack(side="left", fill="x", expand=True, padx=8)
-
-    def open_esus():
-        url = esus_url.get().strip()
-        try:
-            parsed = urlsplit(url)
-            if (parsed.scheme not in ("http", "https") or not parsed.hostname
-                or parsed.username is not None
-                or not re.fullmatch(r"/agenda(?:/\d+(?:/\d{8})?)?/?", parsed.path)):
-                raise ValueError
-        except ValueError:
-            messagebox.showwarning("Link do e-SUS", "Cole o endereço de homologação que termina em /agenda ou o link da agenda selecionada.")
-            return
-        send(("esus", url), "Abrindo e-SUS…")
-
-    esus_button = ttk.Button(setup, text="Abrir e-SUS", command=open_esus)
+    sheets_button = ttk.Button(setup, text="Abrir planilha",
+                               command=lambda: send(("sheets",), "Abrindo planilha…"))
+    sheets_button.pack(side="left", padx=6)
+    esus_button = ttk.Button(setup, text="Abrir e-SUS",
+                             command=lambda: send(("esus",), "Abrindo e-SUS…"))
     esus_button.pack(side="left")
     sigss_button = ttk.Button(setup, text="Abrir SIGSS",
                              command=lambda: send(("sigss",), "Abrindo SIGSS…"))
@@ -193,9 +256,9 @@ def main():
             return
         table.delete(*table.get_children())
         send(vals, "Lendo agenda…")
-    read_button = ttk.Button(form, text="Ler agenda", command=read)
+    read_button = ttk.Button(form, text="Buscar agendas", command=read)
     read_button.pack(side="left", padx=8)
-    actions = (sigss_button, esus_button, read_button)
+    actions = (sigss_button, esus_button, sheets_button, read_button)
     frame = ttk.Frame(root)
     frame.pack(fill="both", expand=True, padx=12, pady=12)
     columns = ("SIGSS", "eSUS previsto", "Paciente", "Cod. SIGSS", "Situação")
@@ -219,9 +282,10 @@ def main():
                     continue
                 controls(True)
                 if kind == "rows":
-                    for row in data:
+                    rows, message = data
+                    for row in rows:
                         table.insert("", "end", values=row)
-                    status.set(f"{len(data)} registros na prévia.")
+                    status.set(f"{len(rows)} registros na prévia. {message}")
                 else:
                     status.set(data)
         except Empty:
