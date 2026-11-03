@@ -33,7 +33,8 @@ def preview(records):
         else:
             state = "Conferir no eSUS"
         yield (r["hour"], "-" if state != "Conferir no eSUS" else hour,
-               r["name"], r["code"], state)
+               r["name"], r["code"],
+               f"Prioridade SIGSS: {r['priority']}" if r.get("priority") else "-", state)
 
 def select_sigss(page, stem, query):
     field = page.locator(f'[id^="{stem}"][id$="_chzn"]')
@@ -138,16 +139,36 @@ def browser_worker(commands, events):
                 date_input.fill(expected_date, timeout=4000)
                 date_input.press("Tab")
                 select_sigss(sigss, "agco_profissionalDestino", professional)
-                with sigss.expect_response(
-                    lambda response: response.request.resource_type in ("xhr", "fetch")
-                    and urlsplit(response.url).netloc == urlsplit(SIGSS).netloc,
-                    timeout=10000,
-                ) as request:
+                sigss.evaluate("""() => {
+                  const grid = document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid');
+                  if (!grid) throw new Error('Grade da agenda não encontrada');
+                  const watch = { changed: 0 };
+                  const isRow = node => node.nodeType === 1 &&
+                    (node.matches('tr.jqgrow, td[title*="Prontuário:"]') ||
+                     node.querySelector('tr.jqgrow, td[title*="Prontuário:"]'));
+                  watch.observer = new MutationObserver(records => {
+                    if (records.some(r => [...r.addedNodes, ...r.removedNodes].some(isRow)
+                        || r.target.parentElement?.closest('.ui-paging-info'))) {
+                      watch.changed = performance.now();
+                    }
+                  });
+                  watch.observer.observe(grid, {subtree: true, childList: true, characterData: true});
+                  window.agendaWatch = watch;
+                }""")
+                try:
                     sigss.get_by_role("button", name="Buscar", exact=True).click(timeout=4000)
-                response = request.value
-                response.finished()
-                if not response.ok:
-                    raise ValueError("A consulta da agenda falhou no SIGSS.")
+                    sigss.wait_for_function("""() => {
+                      const changed = window.agendaWatch?.changed;
+                      const grid = document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid');
+                      const loading = [...(grid?.querySelectorAll('.loading, .jqgrid-overlay') || [])]
+                        .some(el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+                      return changed && !loading && performance.now() - changed >= 350;
+                    }""", timeout=20000)
+                except Error as exc:
+                    raise ValueError("O SIGSS não confirmou a atualização da grade. Tente buscar novamente.") from exc
+                finally:
+                    if not sigss.is_closed():
+                        sigss.evaluate("() => window.agendaWatch?.observer.disconnect()")
                 result = sigss.evaluate("""() => {
                   const selected = stem => document.querySelector(
                     '[id^="' + stem + '"][id$="_chzn"] .chzn-single')?.innerText;
@@ -161,7 +182,17 @@ def browser_worker(commands, events):
                         hour: c.closest('tr').innerText.match(/\\b\\d\\d:\\d\\d\\b/)?.[0],
                         name: c.querySelector('b')?.innerText,
                         code: c.title.match(/Prontuário:\\s*([^\\n]+)/)?.[1]?.trim(),
-                        status: c.closest('tr').cells[c.cellIndex+1]?.innerText.trim()
+                        status: c.closest('tr').cells[c.cellIndex+1]?.innerText.trim(),
+                        priority: (() => {
+                          const headers = [...(document.querySelector('#cb_grid_busca')
+                            ?.closest('tr')?.cells || [])];
+                          const index = headers.findIndex(h => /^(Risco|Prioridade)$/i.test(h.innerText.trim()));
+                          const cell = c.closest('tr').cells[index];
+                          if (!cell) return '';
+                          return [cell, ...cell.querySelectorAll('[title], [aria-label], img[alt]')]
+                            .flatMap(el => [el.innerText, el.title, el.getAttribute('aria-label'), el.getAttribute('alt')])
+                            .map(value => value?.trim()).find(value => value && value !== 'Risco') || '';
+                        })()
                       }))
                   };
                 }""")
@@ -261,9 +292,9 @@ def main():
     actions = (sigss_button, esus_button, sheets_button, read_button)
     frame = ttk.Frame(root)
     frame.pack(fill="both", expand=True, padx=12, pady=12)
-    columns = ("SIGSS", "eSUS previsto", "Paciente", "Cod. SIGSS", "Situação")
+    columns = ("SIGSS", "eSUS previsto", "Paciente", "Cod. SIGSS", "Observação prevista", "Situação")
     table = ttk.Treeview(frame, columns=columns, show="headings")
-    for col, width in zip(columns, (80, 100, 280, 110, 300)):
+    for col, width in zip(columns, (75, 90, 235, 95, 235, 245)):
         table.heading(col, text=col)
         table.column(col, width=width)
     scroll = ttk.Scrollbar(frame, command=table.yview)
