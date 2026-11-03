@@ -1,22 +1,9 @@
 # Transferência de agenda — prévia de homologação
 
-No Windows, extraia o ZIP e abra o PowerShell na pasta extraída. Com Python instalado:
+1. Baixe o ZIP do repositório e extraia a pasta.
+2. Dê dois cliques em **Abrir Agenda.bat**. Na primeira abertura, o programa instala as dependências. O Windows precisa ter o Python com o lançador `py`.
+3. Na janela, cole o link do e-SUS de homologação e clique em **Abrir e-SUS**. O link terminado em `/agenda/` abre a agenda geral. Se você já estiver na agenda desejada, pode colar o endereço completo, inclusive o código do profissional e a data. Confira os filtros na tela do e-SUS.
+4. Na guia do SIGSS, entre em **Atendimento Consulta**, selecione unidade, data e profissional e clique em **Buscar**.
+5. Informe os mesmos filtros na janela do aplicativo e clique em **Ler agenda**.
 
-```powershell
-py -m pip install playwright
-py -m playwright install chromium
-$env:AGENDA_ESUS_HML_URL = "URL da agenda do e-SUS de homologação"
-py app.py
-```
-
-Entre normalmente no SIGSS pela primeira guia do navegador aberto pelo programa.
-Abra Atendimento Consulta, selecione unidade, data e profissional e clique em
-Buscar. Informe os mesmos filtros no aplicativo e clique em Ler agenda. Se a
-consulta estiver paginada, revise cada página. A prévia analisa apenas as linhas
-visíveis e, portanto, a detecção de conflito é limitada à página lida.
-
-A segunda guia abre o eSUS de homologação para conferência manual. A versão
-atual é uma prévia de leitura. O salvamento no eSUS, a retomada e a integração
-com a auditoria online ainda precisam ser implementados e validados.
-
-O SIGSS de Betim já vem configurado. Em AGENDA_ESUS_HML_URL, informe a página inicial da agenda de homologação. Na segunda guia, selecione a data e o profissional pela interface. Use AGENDA_SIGSS_URL apenas se precisar substituir o endereço padrão.
+A prévia verifica as linhas visíveis no SIGSS. Em uma consulta paginada, revise cada página e confira também os conflitos entre páginas. O salvamento no e-SUS e a atualização do Google Sheets ainda não estão disponíveis nesta versão.
