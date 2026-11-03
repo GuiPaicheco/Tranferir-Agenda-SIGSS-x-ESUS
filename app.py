@@ -7,6 +7,7 @@ from collections import Counter
 from datetime import datetime
 from queue import Empty, Queue
 from tkinter import messagebox, ttk
+from urllib.parse import urlsplit
 
 SIGSS = os.environ.get("AGENDA_SIGSS_URL", "http://sigss.betim.mg.gov.br/sigss/atendimentoConsultaAgenda2.jsp")
 ESUS = os.environ.get("AGENDA_ESUS_HML_URL", "")
@@ -41,14 +42,19 @@ def browser_worker(commands, events):
         sigss = context.new_page()
         sigss.goto(SIGSS, wait_until="domcontentloaded")
         esus = context.new_page()
-        try:
-            esus.goto(ESUS, wait_until="domcontentloaded", timeout=12000)
-        except Exception:
-            events.put(("message", "Abra o eSUS de homologação manualmente na segunda guia."))
+        events.put(("message", "Entre no SIGSS e selecione a agenda."))
         while True:
             command = commands.get()
             if command is None:
                 return
+            if command[0] == "esus":
+                try:
+                    esus.goto(command[1], wait_until="domcontentloaded", timeout=12000)
+                    esus.bring_to_front()
+                    events.put(("message", "Confira a data e o profissional no e-SUS."))
+                except Exception:
+                    events.put(("message", "Não foi possível abrir o e-SUS. Confira o endereço e a rede."))
+                continue
             expected_date, professional, unit = command
             try:
                 if sigss.url.split("?")[0] != SIGSS:
@@ -88,11 +94,6 @@ def browser_worker(commands, events):
 
 def main():
     root = tk.Tk()
-    if not ESUS:
-        root.withdraw()
-        messagebox.showerror("Configuração", "Defina AGENDA_ESUS_HML_URL antes de iniciar.")
-        root.destroy()
-        return
     root.title("Transferência de Agenda | Homologação | Prévia")
     root.geometry("1100x560")
     commands, events = Queue(), Queue()
@@ -104,6 +105,28 @@ def main():
     ttk.Label(root, text="Homologação • confira os filtros e clique em Buscar no SIGSS antes de ler a agenda.").pack(pady=12)
     form = ttk.Frame(root)
     form.pack(fill="x", padx=12)
+    setup = ttk.Frame(root)
+    setup.pack(fill="x", padx=12, pady=(0, 8))
+    ttk.Label(setup, text="Link do e-SUS de homologação").pack(side="left")
+    esus_url = ttk.Entry(setup)
+    esus_url.insert(0, ESUS)
+    esus_url.pack(side="left", fill="x", expand=True, padx=8)
+
+    def open_esus():
+        url = esus_url.get().strip()
+        try:
+            parsed = urlsplit(url)
+            if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                or parsed.username is not None
+                or not re.fullmatch(r"/agenda(?:/\d+(?:/\d{8})?)?/?", parsed.path)):
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("Link do e-SUS", "Cole o endereço de homologação que termina em /agenda ou o link da agenda selecionada.")
+            return
+        status.set("Abrindo e-SUS…")
+        commands.put(("esus", url))
+
+    ttk.Button(setup, text="Abrir e-SUS", command=open_esus).pack(side="left")
     fields = []
     for label, default in (("Data", datetime.now().strftime("%d/%m/%Y")),
                            ("Profissional", ""), ("Unidade", "UBS CIDADE VERDE")):
