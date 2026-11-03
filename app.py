@@ -3,6 +3,7 @@ import json
 import os
 import re
 import threading
+import time
 import tkinter as tk
 from collections import Counter
 from datetime import datetime, timedelta
@@ -91,6 +92,120 @@ def open_esus_agenda(page, day, professional):
     field.wait_for(timeout=6000)
 
 
+def search_day(sigss, expected_date, professional, unit):
+    date_input = sigss.locator('input[name="agco.agcoData"]')
+    if not date_input.is_visible():
+        sigss.goto(SIGSS, wait_until="domcontentloaded", timeout=15000)
+    if not date_input.is_visible():
+        sigss.bring_to_front()
+        raise ValueError("Faça login no SIGSS e volte ao aplicativo.")
+    date_input.fill(expected_date, timeout=4000)
+    date_input.press("Tab")
+    select_sigss(sigss, "agco_unidadeSaudeDestino", unit)
+    select_sigss(sigss, "agco_profissionalDestino", professional)
+    filters = {"day": expected_date, "unit": unit, "professional": professional}
+    if not sigss.evaluate("""filters => {
+      const selected = stem => document.querySelector(
+        '[id^="' + stem + '"][id$="_chzn"] .chzn-single'
+      )?.innerText.toLowerCase() || '';
+      return document.querySelector('input[name="agco.agcoData"]')?.value === filters.day
+        && selected('agco_unidadeSaudeDestino').includes(filters.unit.toLowerCase())
+        && selected('agco_profissionalDestino').includes(filters.professional.toLowerCase());
+    }""", filters):
+        raise ValueError(f"Data pendente: {expected_date}. Os filtros mudaram antes da busca.")
+    sigss.evaluate("""() => {
+      const indicator = document.querySelector('#load_grid_busca');
+      const grid = document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid');
+      const visible = el => el.getClientRects().length > 0
+        && getComputedStyle(el).visibility === 'visible';
+      if (!grid || !indicator || visible(indicator)) {
+        throw new Error('Indicador indisponível ou consulta anterior em andamento');
+      }
+      const watch = { started: false, finished: 0, changed: 0, invalid: false };
+      const isRow = node => node.nodeType === 1 &&
+        (node.matches('tr.jqgrow, td[title*="Prontuário:"]') ||
+         node.querySelector('tr.jqgrow, td[title*="Prontuário:"]'));
+      watch.observer = new MutationObserver(records => {
+        if (!indicator.isConnected || !grid.isConnected) {
+          watch.invalid = true;
+          return;
+        }
+        if (visible(indicator)) {
+          watch.started = true;
+          watch.finished = 0;
+        } else if (watch.started && !watch.finished) {
+          watch.finished = performance.now();
+        }
+        if (records.some(record =>
+          [...record.addedNodes, ...record.removedNodes].some(isRow) ||
+          (record.target.nodeType === 1 ? record.target :
+            record.target.parentElement)?.closest('.ui-paging-info'))) {
+          watch.changed = performance.now();
+        }
+      });
+      watch.observer.observe(grid, {subtree: true, childList: true, characterData: true});
+      watch.observer.observe(indicator, {attributes: true,
+        attributeFilter: ['style', 'class', 'hidden']});
+      window.agendaWatch = watch;
+    }""")
+    sigss.get_by_role("button", name="Buscar", exact=True).click(timeout=4000)
+    try:
+        yield
+        if not sigss.evaluate("""() => {
+          const indicator = document.querySelector('#load_grid_busca');
+          const w = window.agendaWatch;
+          return indicator && w && !w.invalid && w.changed
+            && (!indicator.getClientRects().length ||
+                getComputedStyle(indicator).visibility !== 'visible');
+        }"""):
+            raise ValueError(f"Data pendente: {expected_date}. A grade não confirmou a atualização após 10 segundos.")
+    finally:
+        if not sigss.is_closed():
+            sigss.evaluate("() => window.agendaWatch?.observer.disconnect()")
+    result = sigss.evaluate("""() => {
+      const selected = stem => document.querySelector(
+        '[id^="' + stem + '"][id$="_chzn"] .chzn-single')?.innerText;
+      return {
+        day: document.querySelector('input[name="agco.agcoData"]')?.value,
+        professional: selected('agco_profissionalDestino'),
+        unit: selected('agco_unidadeSaudeDestino'),
+        empty: /Nenhum registro/i.test(document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid')?.innerText || ''),
+        paging: document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid')?.innerText.match(/Página\\s+\\d+\\s+de\\s+\\d+/i)?.[0],
+        cbo: selected('agco_atividadeProfissionalCnes'),
+        rows: [...document.querySelectorAll('td[title*="Prontuário:"]')]
+          .filter(c => c.getBoundingClientRect().width)
+          .map(c => ({
+            hour: c.closest('tr').innerText.match(/\\b\\d\\d:\\d\\d\\b/)?.[0],
+            name: c.querySelector('b')?.innerText,
+            code: c.title.match(/Prontuário:\\s*([^\\n]+)/)?.[1]?.trim(),
+            status: c.closest('tr').cells[c.cellIndex+1]?.innerText.trim(),
+            age: c.innerText.split('\\n').find(line => /\\d+ (ano|mês|dia)/.test(line)),
+            preference_titles: [...c.closest('tr').querySelectorAll(
+              'img.icon-button--transparent[title], i.icon-button--transparent[title]'
+            )].map(icon => icon.getAttribute('title'))
+          }))
+      };
+    }""")
+    if (result["day"] != expected_date
+        or professional.casefold() not in (result["professional"] or "").casefold()
+        or unit.casefold() not in (result["unit"] or "").casefold()):
+        raise ValueError("Os filtros do SIGSS não correspondem à data, unidade e profissional informados.")
+    rows = result["rows"]
+    if not rows:
+        if not result.get("empty"):
+            raise ValueError(f"O SIGSS não confirmou o resultado de {expected_date}.")
+        raise ValueError(f"Data pendente: {expected_date}. A grade vazia ainda precisa ser validada no SIGSS.")
+    if any(not r.get("name") or not r.get("code") or
+           not re.fullmatch(r"\d{2}:\d{2}", r.get("hour") or "") for r in rows):
+        raise ValueError("A lista contém registros incompletos. Confira a tela do SIGSS.")
+    selected = (result["professional"] or "").split(" — ")
+    full_name = selected[1] if len(selected) > 1 else professional
+    pages = re.search(r"de (\d+)", result.get("paging") or "")
+    cbo = (result.get("cbo") or "").split(" — ")[-1].strip()
+    complete = bool(pages and pages.group(1) == "1" and cbo and cbo != "...")
+    return (expected_date, full_name, result["unit"].split(" — ")[-1], cbo, rows), complete
+
+
 def browser_worker(commands, events):
     from playwright.sync_api import Error, sync_playwright
     with sync_playwright() as pw:
@@ -177,11 +292,13 @@ def browser_worker(commands, events):
                     completed = 0
                     with journal() as db:
                         for day, name, unit, cbo, records in batch:
+                            esus.bring_to_front()
                             open_esus_agenda(esus, day, name)
                             agenda_url = esus.url
                             if not agenda_url.startswith(ESUS) or not agenda_url.rstrip("/").endswith(day.replace("/", "")):
                                 raise ValueError("Não foi possível confirmar a agenda de homologação.")
                             for record, planned in zip(records, preview(records)):
+                                esus.bring_to_front()
                                 position = completed
                                 phase = "e-SUS"
                                 source, target, _, _, observation, _, state = planned
@@ -195,10 +312,11 @@ def browser_worker(commands, events):
                                     elif saved and saved[0] in ("pendente", "-"):
                                         raise ValueError(f"Não consegui confirmar o agendamento anterior às {source}. Confira o e-SUS antes de retomar.")
                                     else:
-                                        db.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?)", (key, "pendente", ""))
-                                        db.commit()
+                                        def before_save():
+                                            db.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?)", (key, "pendente", ""))
+                                            db.commit()
                                         reason, note = migrate(esus, datetime.strptime(day, "%d/%m/%Y").date(),
-                                                               record, target, observation)
+                                                               record, target, observation, before_save)
                                     db.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?)", (key, reason, note))
                                     db.commit()
                                 elif state == "Cancelado no SIGSS":
@@ -223,7 +341,7 @@ def browser_worker(commands, events):
                 except Exception as err:
                     if position is not None:
                         events.put(("item", (position, f"Pendente · {phase}", "Lote pausado.")))
-                    detail = str(err) if isinstance(err, ValueError) else "Confira a sessão e a conexão."
+                    detail = str(err) if isinstance(err, ValueError) else f"Falha na etapa {phase or 'de preparação'} ({type(err).__name__}). Confira a sessão e a conexão."
                     events.put(("message", f"Lote interrompido. {detail}"))
                 continue
             batch = None
@@ -238,119 +356,38 @@ def browser_worker(commands, events):
                     expected_date = day.strftime("%d/%m/%Y")
                     day += timedelta(days=1)
                     events.put(("progress", f"Buscando {expected_date} no SIGSS…"))
+                    group = [expected_date]
+                    while automatic and len(group) < 5 and day <= end_day:
+                        group.append(day.strftime("%d/%m/%Y"))
+                        day += timedelta(days=1)
                     if sigss.is_closed():
                         sigss = context.new_page()
-                    date_input = sigss.locator('input[name="agco.agcoData"]')
-                    if not date_input.is_visible():
-                        sigss.goto(SIGSS, wait_until="domcontentloaded", timeout=15000)
-                    if not date_input.is_visible():
-                        sigss.bring_to_front()
-                        raise ValueError("Faça login no SIGSS e volte ao aplicativo.")
-                    date_input.fill(expected_date, timeout=4000)
-                    date_input.press("Tab")
-                    select_sigss(sigss, "agco_unidadeSaudeDestino", unit)
-                    select_sigss(sigss, "agco_profissionalDestino", professional)
-                    filters = {"day": expected_date, "unit": unit, "professional": professional}
-                    if not sigss.evaluate("""filters => {
-                      const selected = stem => document.querySelector(
-                        '[id^="' + stem + '"][id$="_chzn"] .chzn-single'
-                      )?.innerText.toLowerCase() || '';
-                      return document.querySelector('input[name="agco.agcoData"]')?.value === filters.day
-                        && selected('agco_unidadeSaudeDestino').includes(filters.unit.toLowerCase())
-                        && selected('agco_profissionalDestino').includes(filters.professional.toLowerCase());
-                    }""", filters):
-                        raise ValueError(f"Data pendente: {expected_date}. Os filtros mudaram antes da busca.")
-                    sigss.evaluate("""() => {
-                      const indicator = document.querySelector('#load_grid_busca');
-                      const grid = document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid');
-                      const visible = el => el.getClientRects().length > 0
-                        && getComputedStyle(el).visibility === 'visible';
-                      if (!grid || !indicator || visible(indicator)) {
-                        throw new Error('Indicador indisponível ou consulta anterior em andamento');
-                      }
-                      const watch = { started: false, finished: 0, changed: 0, invalid: false };
-                      const isRow = node => node.nodeType === 1 &&
-                        (node.matches('tr.jqgrow, td[title*="Prontuário:"]') ||
-                         node.querySelector('tr.jqgrow, td[title*="Prontuário:"]'));
-                      watch.observer = new MutationObserver(records => {
-                        if (!indicator.isConnected || !grid.isConnected) {
-                          watch.invalid = true;
-                          return;
-                        }
-                        if (visible(indicator)) {
-                          watch.started = true;
-                          watch.finished = 0;
-                        } else if (watch.started && !watch.finished) {
-                          watch.finished = performance.now();
-                        }
-                        if (watch.started && records.some(record =>
-                          [...record.addedNodes, ...record.removedNodes].some(isRow) ||
-                          (record.target.nodeType === 1 ? record.target :
-                            record.target.parentElement)?.closest('.ui-paging-info'))) {
-                          watch.changed = performance.now();
-                        }
-                      });
-                      watch.observer.observe(grid, {subtree: true, childList: true, characterData: true});
-                      watch.observer.observe(indicator, {attributes: true,
-                        attributeFilter: ['style', 'class', 'hidden']});
-                      window.agendaWatch = watch;
-                    }""")
+                    extra = []
+                    searches = []
                     try:
-                        sigss.get_by_role("button", name="Buscar", exact=True).click(timeout=4000)
-                        sigss.wait_for_function("""settle => {
-                          const w = window.agendaWatch;
-                          return w && !w.invalid && w.finished && w.changed
-                            && performance.now() - Math.max(w.finished, w.changed) >= settle;
-                        }""", arg=3000 if automatic else 500, timeout=45000)
-                    except Error as exc:
-                        raise ValueError(f"Data pendente: {expected_date}. O SIGSS não confirmou o ciclo de carregamento e a atualização da grade.") from exc
+                        for index, expected_date in enumerate(group):
+                            page = sigss if index == 0 else context.new_page()
+                            if index:
+                                extra.append(page)
+                            search = search_day(page, expected_date, professional, unit)
+                            searches.append(search)
+                            next(search)
+                        events.put(("progress", f"Aguardando 10 segundos para {len(group)} consulta(s)…"))
+                        time.sleep(10)
+                        for expected_date, search in zip(group, searches):
+                            try:
+                                next(search)
+                            except StopIteration as finished:
+                                item, complete = finished.value
+                            if not complete:
+                                incomplete.append(expected_date)
+                            batches.append(item)
+                            previews.extend((expected_date, *row) for row in preview(item[-1]))
                     finally:
-                        if not sigss.is_closed():
-                            sigss.evaluate("() => window.agendaWatch?.observer.disconnect()")
-                    result = sigss.evaluate("""() => {
-                      const selected = stem => document.querySelector(
-                        '[id^="' + stem + '"][id$="_chzn"] .chzn-single')?.innerText;
-                      return {
-                        day: document.querySelector('input[name="agco.agcoData"]')?.value,
-                        professional: selected('agco_profissionalDestino'),
-                        unit: selected('agco_unidadeSaudeDestino'),
-                        empty: /Nenhum registro/i.test(document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid')?.innerText || ''),
-                        paging: document.querySelector('#cb_grid_busca')?.closest('.ui-jqgrid')?.innerText.match(/Página\\s+\\d+\\s+de\\s+\\d+/i)?.[0],
-                        cbo: selected('agco_atividadeProfissionalCnes'),
-                        rows: [...document.querySelectorAll('td[title*="Prontuário:"]')]
-                          .filter(c => c.getBoundingClientRect().width)
-                          .map(c => ({
-                            hour: c.closest('tr').innerText.match(/\\b\\d\\d:\\d\\d\\b/)?.[0],
-                            name: c.querySelector('b')?.innerText,
-                            code: c.title.match(/Prontuário:\\s*([^\\n]+)/)?.[1]?.trim(),
-                            status: c.closest('tr').cells[c.cellIndex+1]?.innerText.trim(),
-                            age: c.innerText.split('\\n').find(line => /\\d+ (ano|mês|dia)/.test(line)),
-                            preference_titles: [...c.closest('tr').querySelectorAll(
-                              'img.icon-button--transparent[title], i.icon-button--transparent[title]'
-                            )].map(icon => icon.getAttribute('title'))
-                          }))
-                      };
-                    }""")
-                    if (result["day"] != expected_date
-                        or professional.casefold() not in (result["professional"] or "").casefold()
-                        or unit.casefold() not in (result["unit"] or "").casefold()):
-                        raise ValueError("Os filtros do SIGSS não correspondem à data, unidade e profissional informados.")
-                    rows = result["rows"]
-                    if not rows:
-                        if not result.get("empty"):
-                            raise ValueError(f"O SIGSS não confirmou o resultado de {expected_date}.")
-                        raise ValueError(f"Data pendente: {expected_date}. A grade vazia ainda precisa ser validada no SIGSS.")
-                    if any(not r.get("name") or not r.get("code") or
-                           not re.fullmatch(r"\d{2}:\d{2}", r.get("hour") or "") for r in rows):
-                        raise ValueError("A lista contém registros incompletos. Confira a tela do SIGSS.")
-                    selected = (result["professional"] or "").split(" — ")
-                    full_name = selected[1] if len(selected) > 1 else professional
-                    pages = re.search(r"de (\d+)", result.get("paging") or "")
-                    cbo = (result.get("cbo") or "").split(" — ")[-1].strip()
-                    if not pages or pages.group(1) != "1" or not cbo or cbo == "...":
-                        incomplete.append(expected_date)
-                    batches.append((expected_date, full_name, result["unit"].split(" — ")[-1], cbo, rows))
-                    previews.extend((expected_date, *row) for row in preview(rows))
+                        for search in searches:
+                            search.close()
+                        for page in extra:
+                            page.close()
                 warning = ("Transferência bloqueada: paginação ou CBO não confirmado em " +
                            ", ".join(incomplete)) if incomplete else "Agenda pronta para revisão."
                 pending = (None if incomplete else batches, previews, warning)
