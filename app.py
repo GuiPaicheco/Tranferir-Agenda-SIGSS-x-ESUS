@@ -346,44 +346,48 @@ def browser_worker(commands, events):
             expected_date = first
             try:
                 previews, batches, incomplete = [], [], []
-                day = datetime.strptime(first, "%d/%m/%Y").date()
-                end_day = datetime.strptime(last, "%d/%m/%Y").date()
-                while day <= end_day:
-                    expected_date = day.strftime("%d/%m/%Y")
-                    day += timedelta(days=1)
-                    events.put(("progress", f"Buscando {expected_date} no SIGSS…"))
-                    group = [expected_date]
-                    while automatic and len(group) < 5 and day <= end_day:
-                        group.append(day.strftime("%d/%m/%Y"))
+                professionals = list(dict.fromkeys(name.strip() for name in professional.split(";") if name.strip()))
+                if not professionals:
+                    raise ValueError("Informe pelo menos um profissional.")
+                for professional in professionals:
+                    day = datetime.strptime(first, "%d/%m/%Y").date()
+                    end_day = datetime.strptime(last, "%d/%m/%Y").date()
+                    while day <= end_day:
+                        expected_date = day.strftime("%d/%m/%Y")
                         day += timedelta(days=1)
-                    if sigss.is_closed():
-                        sigss = context.new_page()
-                    extra = []
-                    searches = []
-                    try:
-                        for index, expected_date in enumerate(group):
-                            page = sigss if index == 0 else context.new_page()
-                            if index:
-                                extra.append(page)
-                            search = search_day(page, expected_date, professional, unit)
-                            searches.append(search)
-                            next(search)
-                        events.put(("progress", f"Aguardando 10 segundos para {len(group)} consulta(s)…"))
-                        time.sleep(10)
-                        for expected_date, search in zip(group, searches):
-                            try:
+                        events.put(("progress", f"Buscando {expected_date} no SIGSS…"))
+                        group = [expected_date]
+                        while automatic and len(group) < 5 and day <= end_day:
+                            group.append(day.strftime("%d/%m/%Y"))
+                            day += timedelta(days=1)
+                        if sigss.is_closed():
+                            sigss = context.new_page()
+                        extra = []
+                        searches = []
+                        try:
+                            for index, expected_date in enumerate(group):
+                                page = sigss if index == 0 else context.new_page()
+                                if index:
+                                    extra.append(page)
+                                search = search_day(page, expected_date, professional, unit)
+                                searches.append(search)
                                 next(search)
-                            except StopIteration as finished:
-                                item, complete = finished.value
-                            if complete:
-                                incomplete.append(f"{expected_date}: {complete}")
-                            batches.append(item)
-                            previews.extend((expected_date, *row) for row in preview(item[-1]))
-                    finally:
-                        for search in searches:
-                            search.close()
-                        for page in extra:
-                            page.close()
+                            events.put(("progress", f"Aguardando 10 segundos para {len(group)} consulta(s)…"))
+                            time.sleep(10)
+                            for expected_date, search in zip(group, searches):
+                                try:
+                                    next(search)
+                                except StopIteration as finished:
+                                    item, complete = finished.value
+                                if complete:
+                                    incomplete.append(f"{expected_date} · {professional}: {complete}")
+                                batches.append(item)
+                                previews.extend((expected_date, item[1], *row) for row in preview(item[-1]))
+                        finally:
+                            for search in searches:
+                                search.close()
+                            for page in extra:
+                                page.close()
                 warning = ("Transferência bloqueada: " + "; ".join(incomplete)
                            if incomplete else "Confira o lote e clique em Transferir e auditar.")
                 batch = None if incomplete else batches
@@ -459,7 +463,7 @@ def main():
     fields = []
     for label, default in (("Data de início", datetime.now().strftime("%d/%m/%Y")),
                            ("Data de fim", datetime.now().strftime("%d/%m/%Y")),
-                           ("Unidade", "UBS CIDADE VERDE"), ("Profissional", "")):
+                           ("Unidade", "UBS CIDADE VERDE"), ("Profissionais (;)", "")):
         ttk.Label(form, text=label).pack(side="left", padx=4)
         field = ttk.Entry(form, width=19)
         field.insert(0, default)
@@ -476,8 +480,8 @@ def main():
         except ValueError:
             messagebox.showwarning("Filtros", "Informe início e fim válidos (dd/mm/aaaa), unidade e profissional.")
             return
-        if not automatic and vals[0] != vals[1]:
-            messagebox.showwarning("Modo manual", "Use a mesma data nos dois campos ou selecione Automatizado.")
+        if not automatic and (vals[0] != vals[1] or ";" in vals[3]):
+            messagebox.showwarning("Modo manual", "Use a mesma data nos dois campos e um profissional, ou selecione Automatizado.")
             return
         ready_to_transfer = False
         table.delete(*table.get_children())
@@ -502,9 +506,9 @@ def main():
     selector.bind("<<ComboboxSelected>>", refresh_mode)
     frame = ttk.Frame(root)
     frame.pack(fill="both", expand=True, padx=12, pady=12)
-    columns = ("Data", "SIGSS", "eSUS previsto", "Paciente", "Cod. SIGSS", "Observação prevista", "Preferências originais", "Situação")
+    columns = ("Data", "Profissional", "SIGSS", "eSUS previsto", "Paciente", "Cod. SIGSS", "Observação prevista", "Preferências originais", "Situação")
     table = ttk.Treeview(frame, columns=columns, show="headings")
-    for col, width in zip(columns, (100, 70, 85, 200, 85, 200, 200, 220)):
+    for col, width in zip(columns, (100, 180, 70, 85, 200, 85, 200, 200, 220)):
         table.heading(col, text=col)
         table.column(col, width=width)
     scroll = ttk.Scrollbar(frame, command=table.yview)
