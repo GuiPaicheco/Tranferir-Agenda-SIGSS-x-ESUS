@@ -39,7 +39,7 @@ def browser_worker(commands, events):
     with sync_playwright() as pw:
         for channel in ("chrome", "msedge"):
             try:
-                browser = pw.chromium.launch(channel=channel, headless=False)
+                browser = pw.chromium.launch(channel=channel, headless=False, timeout=12000)
                 break
             except Error:
                 continue
@@ -48,29 +48,40 @@ def browser_worker(commands, events):
             return
         context = browser.new_context()
         sigss = context.new_page()
-        try:
-            sigss.goto(SIGSS, wait_until="domcontentloaded", timeout=15000)
-        except Error:
-            events.put(("message", "O SIGSS não abriu. Confira a conexão com a rede da Prefeitura."))
-            return
-        esus = context.new_page()
-        events.put(("message", "Entre no SIGSS e selecione a agenda."))
+        esus = None
+        events.put(("ready", "Clique em Abrir SIGSS para entrar com sua conta."))
         while True:
             command = commands.get()
             if command is None:
                 return
+            if not browser.is_connected():
+                events.put(("message", "O navegador foi fechado. Clique em Reconectar navegador."))
+                return
+            if command[0] == "sigss":
+                try:
+                    if sigss.is_closed():
+                        sigss = context.new_page()
+                    sigss.bring_to_front()
+                    sigss.goto(SIGSS, wait_until="domcontentloaded", timeout=15000)
+                    events.put(("message", "Entre no SIGSS se solicitado. Abra Atendimento Consulta e clique em Buscar após selecionar os filtros."))
+                except Error:
+                    events.put(("message", "O SIGSS não abriu. Confira a rede da Prefeitura e tente novamente."))
+                continue
             if command[0] == "esus":
                 try:
+                    if esus is None or esus.is_closed():
+                        esus = context.new_page()
+                    esus.bring_to_front()
                     esus.goto(command[1], wait_until="domcontentloaded", timeout=12000)
                     esus.bring_to_front()
-                    events.put(("message", "Confira a data e o profissional no e-SUS."))
+                    events.put(("message", "Entre no e-SUS se solicitado e confira a data e o profissional."))
                 except Exception:
                     events.put(("message", "Não foi possível abrir o e-SUS. Confira o endereço e a rede."))
                 continue
             expected_date, professional, unit = command
             try:
-                if sigss.url.split("?")[0] != SIGSS:
-                    raise ValueError("Abra Atendimento Consulta na primeira guia.")
+                if sigss.is_closed() or sigss.url.split("?")[0] != SIGSS:
+                    raise ValueError("Clique em Abrir SIGSS, faça login se solicitado e abra Atendimento Consulta.")
                 result = sigss.evaluate("""() => {
                   const selected = stem => document.querySelector(
                     '[id^="' + stem + '"][id$="_chzn"] .chzn-single')?.innerText;
@@ -113,7 +124,26 @@ def main():
         try:
             browser_worker(commands, events)
         except Exception:
-            events.put(("message", "Não foi possível abrir o navegador. Confira a instalação do Playwright."))
+            events.put(("message", "Não foi possível iniciar o Playwright. Confira a instalação."))
+        finally:
+            events.put(("stopped", None))
+
+    def controls(enabled):
+        for button in actions:
+            button.configure(state="normal" if enabled else "disabled")
+
+    def start_browser():
+        while not commands.empty():
+            commands.get_nowait()
+        reconnect.configure(state="disabled")
+        controls(False)
+        status.set("Iniciando navegador…")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def send(command, message):
+        controls(False)
+        status.set(message)
+        commands.put(command)
     ttk.Label(root, text="Homologação • confira os filtros e clique em Buscar no SIGSS antes de ler a agenda.").pack(pady=12)
     form = ttk.Frame(root)
     form.pack(fill="x", padx=12)
@@ -135,10 +165,15 @@ def main():
         except ValueError:
             messagebox.showwarning("Link do e-SUS", "Cole o endereço de homologação que termina em /agenda ou o link da agenda selecionada.")
             return
-        status.set("Abrindo e-SUS…")
-        commands.put(("esus", url))
+        send(("esus", url), "Abrindo e-SUS…")
 
-    ttk.Button(setup, text="Abrir e-SUS", command=open_esus).pack(side="left")
+    esus_button = ttk.Button(setup, text="Abrir e-SUS", command=open_esus)
+    esus_button.pack(side="left")
+    sigss_button = ttk.Button(setup, text="Abrir SIGSS",
+                             command=lambda: send(("sigss",), "Abrindo SIGSS…"))
+    sigss_button.pack(side="left", padx=6)
+    reconnect = ttk.Button(setup, text="Reconectar navegador", command=start_browser)
+    reconnect.pack(side="left")
     fields = []
     for label, default in (("Data", datetime.now().strftime("%d/%m/%Y")),
                            ("Profissional", ""), ("Unidade", "UBS CIDADE VERDE")):
@@ -157,9 +192,10 @@ def main():
             messagebox.showwarning("Filtros", "Informe data (dd/mm/aaaa), profissional e unidade.")
             return
         table.delete(*table.get_children())
-        status.set("Lendo agenda…")
-        commands.put(vals)
-    ttk.Button(form, text="Ler agenda", command=read).pack(side="left", padx=8)
+        send(vals, "Lendo agenda…")
+    read_button = ttk.Button(form, text="Ler agenda", command=read)
+    read_button.pack(side="left", padx=8)
+    actions = (sigss_button, esus_button, read_button)
     frame = ttk.Frame(root)
     frame.pack(fill="both", expand=True, padx=12, pady=12)
     columns = ("SIGSS", "eSUS previsto", "Paciente", "Cod. SIGSS", "Situação")
@@ -177,6 +213,11 @@ def main():
         try:
             while True:
                 kind, data = events.get_nowait()
+                if kind == "stopped":
+                    controls(False)
+                    reconnect.configure(state="normal")
+                    continue
+                controls(True)
                 if kind == "rows":
                     for row in data:
                         table.insert("", "end", values=row)
@@ -186,7 +227,7 @@ def main():
         except Empty:
             pass
         root.after(150, poll)
-    threading.Thread(target=worker, daemon=True).start()
+    start_browser()
     root.protocol("WM_DELETE_WINDOW", lambda: (commands.put(None), root.destroy()))
     poll()
     root.mainloop()
