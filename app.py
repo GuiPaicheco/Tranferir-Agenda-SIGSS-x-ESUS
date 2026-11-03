@@ -157,12 +157,16 @@ def browser_worker(commands, events):
                     events.put(("message", "Não foi possível abrir o e-SUS. Confira o endereço e a rede."))
                 continue
             if command[0] == "transfer":
+                position = None
+                phase = ""
                 try:
                     if not batch:
                         raise ValueError("Busque e confira as agendas antes de transferir.")
                     if esus is None or esus.is_closed():
                         raise ValueError("Clique em Abrir e-SUS e faça login antes de transferir.")
                     connect_sheets(sheets, SHEETS)
+                    total = sum(len(records) for _, _, _, _, records in batch)
+                    completed = 0
                     with journal() as db:
                         for day, name, unit, cbo, records in batch:
                             open_esus_agenda(esus, day, name)
@@ -170,7 +174,11 @@ def browser_worker(commands, events):
                             if not agenda_url.startswith(ESUS) or not agenda_url.rstrip("/").endswith(day.replace("/", "")):
                                 raise ValueError("Não foi possível confirmar a agenda de homologação.")
                             for record, planned in zip(records, preview(records)):
+                                position = completed
+                                phase = "e-SUS"
                                 source, target, _, _, observation, _, state = planned
+                                events.put(("item", (position, "Conferindo no e-SUS",
+                                    f"{completed + 1}/{total} · {day} · {source}")))
                                 key = json.dumps([agenda_url, day, unit, cbo, source, record["code"]])
                                 saved = db.execute("SELECT result,note FROM jobs WHERE key=?", (key,)).fetchone()
                                 if saved and saved[0] == "pendente":
@@ -191,14 +199,23 @@ def browser_worker(commands, events):
                                 else:
                                     reason, note = "Inconsistência na vaga", state
                                 success = reason == "-" and note != "Cancelado no SIGSS"
+                                phase = "auditoria"
+                                outcome = "Transferido" if success else f"Não transferido · {note or reason}"
+                                events.put(("item", (position, f"{outcome} · Registrando na planilha",
+                                    f"{completed + 1}/{total} · {day} · {source}")))
                                 publish(sheets, [day, source, target if success else "-",
                                         "Transferido" if success else "Não transferido",
                                         record["code"], record["name"], name, cbo, unit, reason], note)
-                    events.put(("message", "Lote concluído. Confira o histórico na planilha."))
-                except ValueError as err:
-                    events.put(("message", str(err)))
-                except Exception:
-                    events.put(("message", "Lote interrompido. Confira o e-SUS e a conexão com o Google Sheets."))
+                                completed += 1
+                                events.put(("item", (position, f"{outcome} · Auditado",
+                                    f"{completed}/{total} registrados na planilha.")))
+                                position = None
+                    events.put(("message", f"Lote concluído. {completed}/{total} registrados na planilha."))
+                except Exception as err:
+                    if position is not None:
+                        events.put(("item", (position, f"Pendente · {phase}", "Lote pausado.")))
+                    detail = str(err) if isinstance(err, ValueError) else "Confira a sessão e a conexão."
+                    events.put(("message", f"Lote interrompido. {detail}"))
                 continue
             batch = None
             first, last, professional, unit = command
@@ -376,7 +393,7 @@ def main():
         if messagebox.askyesno("Homologação", "Transferir a prévia conferida e atualizar a auditoria?"):
             send(("transfer",), "Transferindo e atualizando a auditoria…")
 
-    transfer_button = ttk.Button(form, text="Transferir prévia", command=transfer)
+    transfer_button = ttk.Button(form, text="3. Transferir prévia", command=transfer)
     transfer_button.pack(side="left", padx=6)
     actions = (sigss_button, esus_button, sheets_button, read_button, transfer_button)
     frame = ttk.Frame(root)
@@ -389,6 +406,9 @@ def main():
     scroll = ttk.Scrollbar(frame, command=table.yview)
     table.configure(yscrollcommand=scroll.set)
     scroll.pack(side="right", fill="y")
+    horizontal = ttk.Scrollbar(frame, orient="horizontal", command=table.xview)
+    table.configure(xscrollcommand=horizontal.set)
+    horizontal.pack(side="bottom", fill="x")
     table.pack(fill="both", expand=True)
     status = tk.StringVar(value="Abrindo navegador…")
     ttk.Label(root, textvariable=status).pack(pady=(0, 12))
@@ -400,14 +420,22 @@ def main():
                     controls(False)
                     reconnect.configure(state="normal")
                     continue
+                if kind == "item":
+                    index, outcome, message = data
+                    item = str(index)
+                    if table.exists(item):
+                        table.set(item, "Situação", outcome)
+                        table.see(item)
+                    status.set(message)
+                    continue
                 if kind == "progress":
                     status.set(data)
                     continue
                 controls(True)
                 if kind == "rows":
                     rows, message = data
-                    for row in rows:
-                        table.insert("", "end", values=row)
+                    for index, row in enumerate(rows):
+                        table.insert("", "end", iid=str(index), values=row)
                     status.set(f"{len(rows)} registros na prévia. {message}")
                 else:
                     status.set(data)
