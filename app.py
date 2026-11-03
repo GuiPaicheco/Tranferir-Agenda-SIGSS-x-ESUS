@@ -18,6 +18,24 @@ def convert(hour):
     rounded = 20 * ((h * 60 + m + 10) // 20)
     return "-" if rounded >= 1440 else f"{rounded // 60:02d}:{rounded % 60:02d}"
 
+PREFERENCES = {
+    "preferencial +60 anos": "Preferencial +60 anos",
+    "preferencial +80 anos": "Preferencial +80 anos",
+    "gestante": "Gestante",
+    "pessoa com deficiência": "Pessoa com deficiência",
+    "pessoa com deficiï¿½ncia": "Pessoa com deficiência",
+}
+
+
+def preference_notes(titles):
+    matched = [(title, PREFERENCES[title.strip().casefold()])
+               for title in titles if title.strip().casefold() in PREFERENCES]
+    labels = list(dict.fromkeys(label for _, label in matched))
+    observation = "Prioridade SIGSS: " + "; ".join(labels) if labels else "-"
+    originals = " | ".join(title for title, _ in matched) or "-"
+    return observation, originals
+
+
 def preview(records):
     active = Counter(convert(r["hour"]) for r in records if r["status"] != "Cancelado")
     for r in records:
@@ -34,7 +52,7 @@ def preview(records):
             state = "Conferir no eSUS"
         yield (r["hour"], "-" if state != "Conferir no eSUS" else hour,
                r["name"], r["code"],
-               f"Prioridade SIGSS: {r['priority']}" if r.get("priority") else "-", state)
+               *preference_notes(r.get("preference_titles", [])), state)
 
 def select_sigss(page, stem, query):
     field = page.locator(f'[id^="{stem}"][id$="_chzn"]')
@@ -183,16 +201,9 @@ def browser_worker(commands, events):
                         name: c.querySelector('b')?.innerText,
                         code: c.title.match(/Prontuário:\\s*([^\\n]+)/)?.[1]?.trim(),
                         status: c.closest('tr').cells[c.cellIndex+1]?.innerText.trim(),
-                        priority: (() => {
-                          const headers = [...(document.querySelector('#cb_grid_busca')
-                            ?.closest('tr')?.cells || [])];
-                          const index = headers.findIndex(h => /^(Prioridade|Prioridade preferencial|Atendimento preferencial)$/i.test(h.innerText.trim()));
-                          const cell = c.closest('tr').cells[index];
-                          if (!cell) return '';
-                          return [cell, ...cell.querySelectorAll('[title], [aria-label], img[alt]')]
-                            .flatMap(el => [el.innerText, el.title, el.getAttribute('aria-label'), el.getAttribute('alt')])
-                            .map(value => value?.trim()).find(value => value && !/^(Prioridade|Prioridade preferencial|Atendimento preferencial)$/i.test(value)) || '';
-                        })()
+                        preference_titles: [...c.closest('tr').querySelectorAll(
+                          'img.icon-button--transparent[title], i.icon-button--transparent[title]'
+                        )].map(icon => icon.getAttribute('title'))
                       }))
                   };
                 }""")
@@ -292,9 +303,9 @@ def main():
     actions = (sigss_button, esus_button, sheets_button, read_button)
     frame = ttk.Frame(root)
     frame.pack(fill="both", expand=True, padx=12, pady=12)
-    columns = ("SIGSS", "eSUS previsto", "Paciente", "Cod. SIGSS", "Observação prevista", "Situação")
+    columns = ("SIGSS", "eSUS previsto", "Paciente", "Cod. SIGSS", "Observação prevista", "Preferências originais", "Situação")
     table = ttk.Treeview(frame, columns=columns, show="headings")
-    for col, width in zip(columns, (75, 90, 235, 95, 235, 245)):
+    for col, width in zip(columns, (70, 85, 200, 85, 200, 200, 220)):
         table.heading(col, text=col)
         table.column(col, width=width)
     scroll = ttk.Scrollbar(frame, command=table.yview)
