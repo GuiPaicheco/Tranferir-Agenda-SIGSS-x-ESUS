@@ -154,7 +154,7 @@ def browser_worker(commands, events):
                     day, name, unit, cbo, records, agenda_url = batch
                     if esus.is_closed() or esus.url != agenda_url or not agenda_url.startswith(ESUS):
                         raise ValueError("Abra a agenda correta em homologação com Buscar agendas.")
-                    api, sheet_id = connect_sheets(SHEETS)
+                    connect_sheets(sheets, SHEETS)
                     with journal() as db:
                         for record, planned in zip(records, preview(records)):
                             source, target, _, _, observation, _, state = planned
@@ -178,7 +178,7 @@ def browser_worker(commands, events):
                             else:
                                 reason, note = "Inconsistência na vaga", state
                             success = reason == "-" and note != "Cancelado no SIGSS"
-                            publish(api, sheet_id, [day, source, target if success else "-",
+                            publish(sheets, [day, source, target if success else "-",
                                     "Transferido" if success else "Não transferido",
                                     record["code"], record["name"], name, cbo, unit, reason], note)
                     events.put(("message", "Lote concluído. Confira o histórico na planilha."))
